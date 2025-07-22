@@ -23,12 +23,6 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 import os
 
-# --- Sionna Imports ---
-import sionna
-import tensorflow as tf
-print(f"Sionna Version: {sionna.__version__}")
-print(f"TensorFlow Version: {tf.__version__}")
-
 # Sionna Imports (ensure Sionna version >= 0.19)
 from sionna.phy.channel.tr38901 import CDL, PanelArray
 from sionna.phy.channel import subcarrier_frequencies, cir_to_ofdm_channel, AWGN
@@ -422,10 +416,19 @@ optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=1.0)
 ppo_agent = PPOAgent(actor, critic, optimizer)
 
 params = {
-    'K': K, 'Nt': Nt, 'Nr': Nr, 'Ns': Ns, 'tau': tau, 
-    'sampling_frequency': sampling_frequency, 'fft_size': fft_size, 
-    'subcarrier_spacing': subcarrier_spacing, 'num_ofdm_symbols': num_ofdm_symbols,
-    'bits_per_symbol': bits_per_symbol
+    'K': K,
+    'Nt': Nt,
+    'Nr': Nr,
+    'Ns': Ns,
+    'tau': tau,
+    'sampling_frequency': sampling_frequency,
+    'fft_size': fft_size,
+    'subcarrier_spacing': subcarrier_spacing,
+    'num_ofdm_symbols': num_ofdm_symbols,
+    'bits_per_symbol': bits_per_symbol,
+    'num_guard_carriers': (0, 0),
+    'dc_null': False,
+    'pilot_pattern': 'empty'
 }
 
 # --- Fixed Precoding & Symbols for the Environment ---
@@ -602,20 +605,19 @@ def run_siso_ofdm_ber(noise_variance, params):
         num_streams_per_tx=1
     )
     siso_mapper = ResourceGridMapper(rg_siso)
+    rg_demapper_siso = ResourceGridDemapper(rg_siso)
     
     num_bits = rg_siso.num_data_symbols * params['bits_per_symbol']
     bits = tf.random.uniform(shape=[batch_size, num_bits], maxval=2, dtype=tf.int32)
     
     symbols = mapper(bits)
-    x_rg = siso_mapper(tf.reshape(symbols, [batch_size, 1, 1, -1]))
+    x_rg = siso_mapper(symbols)
     
     x_time = modulator(x_rg)
     y_time = AWGN()([x_time, noise_variance])
-    # CORRECTED: The demodulator in recent Sionna versions only takes the received signal.
     x_demod = demodulator(y_time)
     
-    # CORRECTED: get_symbols is now an instance method of ResourceGrid.
-    symbols_hat, _ = rg_siso.get_symbols(x_demod)
+    symbols_hat = rg_demapper_siso(x_demod)
     bits_hat = demapper(symbols_hat)
     
     num_errors = tf.reduce_sum(tf.cast(bits != bits_hat, tf.float32))
@@ -627,53 +629,84 @@ def run_mu_mimo_ber(combiner, H_k_freq, V_k_list, k_idx, noise_variance, params)
     batch_size = 16
     K, Ns, Nt = params['K'], params['Ns'], params['Nt']
     
+    # Calculate required dimensions for the resource grid
+    num_subcarriers = params['fft_size']
+    num_ofdm_symbols = params['num_ofdm_symbols']
+    
+    # Create a resource grid configuration that matches our data dimensions
     rg = ResourceGrid(
-        num_ofdm_symbols=params['num_ofdm_symbols'],
-        fft_size=params['fft_size'],
+        num_ofdm_symbols=num_ofdm_symbols,
+        fft_size=num_subcarriers,
         subcarrier_spacing=params['subcarrier_spacing'],
-        num_tx=K,
-        num_streams_per_tx=Ns
+        num_tx=1,  # Single transmitter since we process one user at a time
+        num_streams_per_tx=Ns,
+        num_guard_carriers=(0, 0),
+        dc_null=False,
+        pilot_pattern='empty'
     )
-    rg_mapper = ResourceGridMapper(rg)
-
-    num_bits_per_user = rg.num_data_symbols * params['bits_per_symbol']
-    bits = tf.random.uniform([batch_size, K, num_bits_per_user], minval=0, maxval=2, dtype=tf.int32)
+    
+    # Calculate the number of data symbols we can fit in the resource grid
+    symbols_per_stream = rg.num_data_symbols // Ns
+    num_bits = symbols_per_stream * params['bits_per_symbol']
+    
+    # Generate bits for transmission
+    bits = tf.random.uniform([batch_size, num_bits], minval=0, maxval=2, dtype=tf.int32)
+    
+    # Map bits to symbols
     symbols = mapper(bits)
-    symbols_reshaped = tf.reshape(symbols, [batch_size, K, Ns, -1])
-    x_mapped = rg_mapper(symbols_reshaped)
-
-    V_precoder = tf.concat(V_k_list, axis=1)
-    V_reshaped = tf.reshape(V_precoder, [Nt, K, Ns])
-    x_tx_freq = tf.einsum('bknsf,tkn->btsf', x_mapped, V_reshaped)
-
-    H_k_batch = tf.expand_dims(H_k_freq, axis=0)
+    
+    # Reshape symbols to match resource grid dimensions [batch_size, num_tx, num_streams, num_symbols]
+    symbols = tf.reshape(symbols, [batch_size, 1, Ns, symbols_per_stream])
+    
+    # Map symbols to the resource grid
+    rg_mapper = ResourceGridMapper(rg)
+    x_mapped = rg_mapper(symbols)
+    
+    # Apply precoding for the user of interest
+    x_tx_freq = tf.zeros([batch_size, Nt, 1, num_subcarriers], dtype=tf.complex64)
+    for ns in range(Ns):
+        x_tx_freq += tf.einsum('btsf,nt->bnsf',
+                              x_mapped[:, :, ns:ns+1, :],
+                              V_k_list[k_idx][:, ns:ns+1])
+    
+    # Apply channel
+    H_k_batch = tf.expand_dims(H_k_freq, axis=0)  # Add batch dimension
     y_freq = tf.einsum('brtf,btsf->brsf', H_k_batch, x_tx_freq)
     
-    # Changed noise generation to use separate calls instead of tuple
-    noise_real = tf.random.normal(tf.shape(y_freq), stddev=tf.sqrt(noise_variance/2))
-    noise_imag = tf.random.normal(tf.shape(y_freq), stddev=tf.sqrt(noise_variance/2))
-    noise = tf.complex(noise_real, noise_imag)
+    # Add noise
+    noise_stddev = tf.sqrt(noise_variance/2)
+    noise = tf.complex(
+        tf.random.normal(tf.shape(y_freq), stddev=noise_stddev),
+        tf.random.normal(tf.shape(y_freq), stddev=noise_stddev)
+    )
     y_freq_noisy = y_freq + noise
-
+    
+    # Apply combining
     s_hat_freq = tf.einsum('sn,brsf->bsf', combiner, y_freq_noisy)
     
+    # Configure receive resource grid
     rg_rx = ResourceGrid(
-        num_ofdm_symbols=params['num_ofdm_symbols'],
-        fft_size=params['fft_size'],
+        num_ofdm_symbols=num_ofdm_symbols,
+        fft_size=num_subcarriers,
         subcarrier_spacing=params['subcarrier_spacing'],
-        num_tx=Ns,
-        num_streams_per_tx=1
+        num_tx=1,
+        num_streams_per_tx=Ns,
+        num_guard_carriers=(0, 0),
+        dc_null=False,
+        pilot_pattern='empty'
     )
     
-    # Use ResourceGridDemapper instead of get_symbols method
+    # Demap received symbols
     rg_demapper = ResourceGridDemapper(rg_rx)
     s_hat = rg_demapper(s_hat_freq)
+    
+    # Convert symbols back to bits
     bits_hat = demapper(s_hat)
     
-    original_bits_k = tf.reshape(bits[:, k_idx, :], [batch_size, -1])
-    num_errors = tf.reduce_sum(tf.cast(original_bits_k != bits_hat, tf.float32))
+    # Calculate bit errors
+    num_errors = tf.reduce_sum(tf.cast(bits != bits_hat, tf.float32))
     
-    return num_errors, tf.cast(tf.size(original_bits_k), tf.float32)
+    return num_errors, tf.cast(tf.size(bits), tf.float32)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EVALUATION LOOP OVER ALL SNRs
@@ -703,7 +736,6 @@ for snr_db in snr_dBs_eval:
     eval_env = MIMOEnvironment(channels, encoder, fixed_V_k, fixed_s_k, snr_db, params)
 
     for step in range(num_eval_steps):
-        # CORRECTED: The channel call now returns 2 values (h, delays).
         h, path_delays = channels[0](batch_size=1, num_time_steps=1, sampling_frequency=sampling_frequency)
         frequencies = subcarrier_frequencies(fft_size, subcarrier_spacing)
         H_k_freq_domain = cir_to_ofdm_channel(frequencies, h, path_delays)
