@@ -422,9 +422,9 @@ params = {
     'Ns': Ns,
     'tau': tau,
     'sampling_frequency': sampling_frequency,
-    'fft_size': fft_size,
+    'fft_size': 128,  # Reduced from 256
     'subcarrier_spacing': subcarrier_spacing,
-    'num_ofdm_symbols': num_ofdm_symbols,
+    'num_ofdm_symbols': 7,  # Reduced from 14
     'bits_per_symbol': bits_per_symbol,
     'num_guard_carriers': (0, 0),
     'dc_null': False,
@@ -652,7 +652,9 @@ def run_mu_mimo_ber(combiner, H_k_freq, V_k_list, k_idx, noise_variance, params)
     symbols = mapper(bits)
     
     # Reshape symbols to match resource grid expectations
-    symbols = tf.reshape(symbols, [batch_size, 1, Ns, -1])  # Changed reshape to match new dimensions
+    # Fix: Flatten symbols and then reshape to match data indices
+    symbols_flat = tf.reshape(symbols, [batch_size, -1])
+    symbols = tf.reshape(symbols_flat, [batch_size, 1, Ns, -1])
     
     # Map symbols to the resource grid
     rg_mapper = ResourceGridMapper(rg)
@@ -661,7 +663,7 @@ def run_mu_mimo_ber(combiner, H_k_freq, V_k_list, k_idx, noise_variance, params)
     # Apply precoding
     x_tx_freq = tf.zeros([batch_size, Nt, 1, rg.fft_size], dtype=tf.complex64)
     for ns in range(Ns):
-        x_tx_freq += tf.einsum('btsf,nt->bnsf', 
+        x_tx_freq += tf.einsum('btsf,nt->bnsf',
                               x_mapped[:, :, ns:ns+1, :],
                               V_k_list[k_idx][:, ns:ns+1])
     
