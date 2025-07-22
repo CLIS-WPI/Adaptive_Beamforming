@@ -643,18 +643,20 @@ def run_mu_mimo_ber(combiner, H_k_freq, V_k_list, k_idx, noise_variance, params)
     
     # Calculate the actual number of data symbols available
     num_data_symbols = rg.num_data_symbols
-    num_bits = num_data_symbols * params['bits_per_symbol']
     
-    # Generate bits based on actual capacity
+    # Generate bits and symbols to exactly match resource grid capacity
+    symbols_per_stream = num_data_symbols // Ns
+    total_symbols = symbols_per_stream * Ns
+    num_bits = total_symbols * params['bits_per_symbol']
+    
+    # Generate bits based on exact capacity
     bits = tf.random.uniform([batch_size, num_bits], minval=0, maxval=2, dtype=tf.int32)
     
     # Map bits to symbols
     symbols = mapper(bits)
     
-    # Reshape symbols to match resource grid expectations
-    # Fix: Flatten symbols and then reshape to match data indices
-    symbols_flat = tf.reshape(symbols, [batch_size, -1])
-    symbols = tf.reshape(symbols_flat, [batch_size, 1, Ns, -1])
+    # Reshape to match resource grid expectations exactly
+    symbols = tf.reshape(symbols, [batch_size, 1, Ns, symbols_per_stream])
     
     # Map symbols to the resource grid
     rg_mapper = ResourceGridMapper(rg)
