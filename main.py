@@ -629,48 +629,44 @@ def run_mu_mimo_ber(combiner, H_k_freq, V_k_list, k_idx, noise_variance, params)
     batch_size = 16
     K, Ns, Nt = params['K'], params['Ns'], params['Nt']
     
-    # Calculate required dimensions for the resource grid
-    num_subcarriers = params['fft_size']
-    num_ofdm_symbols = params['num_ofdm_symbols']
-    
-    # Create a resource grid configuration that matches our data dimensions
+    # Modified ResourceGrid configuration
     rg = ResourceGrid(
-        num_ofdm_symbols=num_ofdm_symbols,
-        fft_size=num_subcarriers,
+        num_ofdm_symbols=params['num_ofdm_symbols'],
+        fft_size=params['fft_size'],
         subcarrier_spacing=params['subcarrier_spacing'],
-        num_tx=1,  # Single transmitter since we process one user at a time
+        num_tx=1,  # Changed from K to 1 since we're focusing on one user
         num_streams_per_tx=Ns,
         num_guard_carriers=(0, 0),
         dc_null=False,
         pilot_pattern='empty'
     )
     
-    # Calculate the number of data symbols we can fit in the resource grid
-    symbols_per_stream = rg.num_data_symbols // Ns
-    num_bits = symbols_per_stream * params['bits_per_symbol']
+    # Calculate the actual number of data symbols available
+    num_data_symbols = rg.num_data_symbols
+    num_bits = num_data_symbols * params['bits_per_symbol']
     
-    # Generate bits for transmission
+    # Generate bits based on actual capacity
     bits = tf.random.uniform([batch_size, num_bits], minval=0, maxval=2, dtype=tf.int32)
     
     # Map bits to symbols
     symbols = mapper(bits)
     
-    # Reshape symbols to match resource grid dimensions [batch_size, num_tx, num_streams, num_symbols]
-    symbols = tf.reshape(symbols, [batch_size, 1, Ns, symbols_per_stream])
+    # Reshape symbols to match resource grid expectations
+    symbols = tf.reshape(symbols, [batch_size, 1, Ns, -1])  # Changed reshape to match new dimensions
     
     # Map symbols to the resource grid
     rg_mapper = ResourceGridMapper(rg)
     x_mapped = rg_mapper(symbols)
     
-    # Apply precoding for the user of interest
-    x_tx_freq = tf.zeros([batch_size, Nt, 1, num_subcarriers], dtype=tf.complex64)
+    # Apply precoding
+    x_tx_freq = tf.zeros([batch_size, Nt, 1, rg.fft_size], dtype=tf.complex64)
     for ns in range(Ns):
-        x_tx_freq += tf.einsum('btsf,nt->bnsf',
+        x_tx_freq += tf.einsum('btsf,nt->bnsf', 
                               x_mapped[:, :, ns:ns+1, :],
                               V_k_list[k_idx][:, ns:ns+1])
     
     # Apply channel
-    H_k_batch = tf.expand_dims(H_k_freq, axis=0)  # Add batch dimension
+    H_k_batch = tf.expand_dims(H_k_freq, axis=0)
     y_freq = tf.einsum('brtf,btsf->brsf', H_k_batch, x_tx_freq)
     
     # Add noise
@@ -684,10 +680,10 @@ def run_mu_mimo_ber(combiner, H_k_freq, V_k_list, k_idx, noise_variance, params)
     # Apply combining
     s_hat_freq = tf.einsum('sn,brsf->bsf', combiner, y_freq_noisy)
     
-    # Configure receive resource grid
+    # Demap symbols
     rg_rx = ResourceGrid(
-        num_ofdm_symbols=num_ofdm_symbols,
-        fft_size=num_subcarriers,
+        num_ofdm_symbols=params['num_ofdm_symbols'],
+        fft_size=params['fft_size'],
         subcarrier_spacing=params['subcarrier_spacing'],
         num_tx=1,
         num_streams_per_tx=Ns,
@@ -695,12 +691,10 @@ def run_mu_mimo_ber(combiner, H_k_freq, V_k_list, k_idx, noise_variance, params)
         dc_null=False,
         pilot_pattern='empty'
     )
-    
-    # Demap received symbols
     rg_demapper = ResourceGridDemapper(rg_rx)
     s_hat = rg_demapper(s_hat_freq)
     
-    # Convert symbols back to bits
+    # Demap bits
     bits_hat = demapper(s_hat)
     
     # Calculate bit errors
