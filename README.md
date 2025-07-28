@@ -25,8 +25,9 @@ The system outperforms traditional methods like MRC, MMSE, and RBD by adaptively
 
 ### 1. Build Docker Image (No Cache)
 ```bash
-docker build --no-cache -t adaptive_beamforming .
+docker build -t adaptive_beamforming .
 
+docker run --gpus all adaptive_beamforming
 ### 2. Build Docker Image (No Cache)
 ```bash
 docker run --rm -it --gpus all -v "$(pwd):/workspace" adaptive_beamforming /bin/bash
