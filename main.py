@@ -669,7 +669,7 @@ def run_siso_ofdm_ber(noise_variance, params):
     symbols_hat = tf.squeeze(symbols_hat, axis=[1, 2])  # [batch_size, num_data_symbols]
     
     # Demap symbols to bits (Sionna 1.1.0 Demapper requires noise variance 'no')
-    bits_hat = demapper(symbols_hat, tf.cast(noise_variance, tf.float64))
+    bits_hat = demapper(symbols_hat, tf.cast(noise_variance, tf.float32))
     
     # Truncate bits_hat to match original bits size if needed
     original_bits_size = tf.shape(bits)[1]
@@ -721,35 +721,19 @@ def run_mu_mimo_ber(combiner, H_k_freq, V_k_list, k_idx, noise_variance, params)
     # Simplified approach - work directly with frequency domain
     # Use a subset of subcarriers to avoid resource grid complexity
     num_subcarriers = 64  # Use a fixed number of subcarriers for simplicity
-    symbols_per_stream = 50  # Fixed number of symbols per stream
-    
+    symbols_per_stream = num_subcarriers  # Ensure data matches subcarriers
+
     # Generate bits for all streams
     num_bits_per_stream = symbols_per_stream * params['bits_per_symbol']
     total_bits = num_bits_per_stream * Ns
     bits = tf.random.uniform([batch_size, total_bits], minval=0, maxval=2, dtype=tf.int32)
-    
+
     # Map bits to symbols
     symbols = mapper(bits)  # [batch_size, total_symbols]
-    
-    # Calculate actual symbols generated and ensure it's divisible by Ns
-    actual_symbols_total = tf.shape(symbols)[1]
-    symbols_per_stream = actual_symbols_total // Ns
-    
-    # Truncate to make it evenly divisible
-    symbols_to_use = symbols_per_stream * Ns
-    symbols = symbols[:, :symbols_to_use]
-    
+
     # Reshape to [batch_size, Ns, symbols_per_stream]
     symbols = tf.reshape(symbols, [batch_size, Ns, symbols_per_stream])
-    
-    # Pad or truncate to match number of subcarriers
-    if symbols_per_stream > num_subcarriers:
-        symbols = symbols[:, :, :num_subcarriers]
-        actual_subcarriers = num_subcarriers
-    else:
-        padding = num_subcarriers - symbols_per_stream
-        symbols = tf.pad(symbols, [[0, 0], [0, 0], [0, padding]])
-        actual_subcarriers = num_subcarriers
+    actual_subcarriers = num_subcarriers
     
     # Apply precoding - symbols shape: [batch_size, Ns, actual_subcarriers]
     # V_k_list[k_idx] shape: [Nt, Ns]
@@ -798,22 +782,18 @@ def run_mu_mimo_ber(combiner, H_k_freq, V_k_list, k_idx, noise_variance, params)
     # Apply combining: combiner is [Ns, Nr], y_freq_noisy is [batch, Nr, actual_subcarriers]
     s_hat = tf.einsum('sr,brf->bsf', combiner, y_freq_noisy)
     
-    # Simple bit error calculation - compare real parts
-    # This is a simplified approach for demonstration
-    symbols_real = tf.math.real(symbols)
-    s_hat_real = tf.math.real(s_hat)
-    
-    # Truncate s_hat to match symbols size
-    s_hat_truncated = s_hat_real[:, :, :tf.shape(symbols_real)[2]]
-    
-    # Simple hard decision: positive real part = 1, negative = 0
-    symbols_bits = tf.cast(symbols_real > 0, tf.int32)
-    s_hat_bits = tf.cast(s_hat_truncated > 0, tf.int32)
-    
-    # Calculate bit errors
-    num_errors = tf.reduce_sum(tf.cast(symbols_bits != s_hat_bits, tf.float32))
-    total_compared_bits = tf.cast(tf.size(symbols_bits), tf.float32)
-    
+    # --- Correct BER calculation for 16-QAM using Sionna demapper ---
+    # 1. Flatten the estimated symbols from [batch, streams, symbols] to [batch, total_symbols]
+    s_hat_flat = tf.reshape(s_hat, [tf.shape(s_hat)[0], -1])
+    # 2. Use the demapper to correctly convert symbols to bits for 16-QAM
+    noise_variance_float32 = tf.cast(noise_variance, tf.float32)
+    bits_hat = demapper(s_hat_flat, noise_variance_float32)
+    # 3. Ensure the number of bits matches the original transmitted bits
+    total_bits = tf.shape(bits)[1]
+    bits_hat = bits_hat[:, :total_bits]
+    # 4. Calculate the number of errors
+    num_errors = tf.reduce_sum(tf.cast(bits != tf.cast(bits_hat, tf.int32), tf.float32))
+    total_compared_bits = tf.cast(tf.size(bits), tf.float32)
     return num_errors, total_compared_bits
 
 # ──────────────────────────────────────────────────────────────────────────────
