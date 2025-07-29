@@ -534,64 +534,20 @@ def mrc_combiner(H_k, V_k):
     
     return W_k
 
-def mmse_combiner(H_k, V_k_list, noise_variance, params):
-    """
-    Calculates the Minimum Mean Square Error (MMSE) combiner.
-    
-    Args:
-        H_k: Channel matrix [Nr, Nt]
-        V_k_list: List of precoding matrices for all users
-        noise_variance: Noise variance (scalar)
-        params: System parameters
-    
-    Returns:
-        W_k: MMSE combining matrix [Ns, Nr]
-    """
-    Nr, Nt = params['Nr'], params['Nt']
-    Ns = params['Ns']
-    k_idx = 0  # User of interest
-    
-    # Build interference covariance matrix
-    interference_cov = tf.zeros([Nr, Nr], dtype=tf.complex64)
-    
-    for i, V_i in enumerate(V_k_list):
-        H_eff_i = tf.matmul(H_k, V_i)  # [Nr, Ns]
-        if i == k_idx:
-            # Store desired channel for later
-            H_desired = H_eff_i
-        else:
-            # Add interference contribution
-            interference_cov += tf.matmul(H_eff_i, H_eff_i, adjoint_b=True)
-    
-    # Add noise covariance
-    noise_cov = tf.cast(noise_variance, dtype=tf.complex64) * tf.eye(Nr, dtype=tf.complex64)
-    total_cov = interference_cov + noise_cov
-    
-    # MMSE solution: W^H = (H_desired * (total_cov)^-1)^H
-    try:
-        # Use Cholesky decomposition for numerical stability (following Sionna pattern)
-        L = tf.linalg.cholesky(total_cov)
-        W_mmse_h = tf.linalg.cholesky_solve(L, H_desired)
-        W_k = tf.linalg.adjoint(W_mmse_h)  # [Ns, Nr]
-    except tf.errors.InvalidArgumentError:
-        # Fallback to regular solve if Cholesky fails
-        W_mmse_h = tf.linalg.solve(total_cov, H_desired)
-        W_k = tf.linalg.adjoint(W_mmse_h)  # [Ns, Nr]
-    
-    return W_k
+
 
 def mmse_combiner(H_k, V_k_list, noise_variance, params):
     """Calculates the Minimum Mean Square Error (MMSE) combiner."""
     K, Nt, Nr = params['K'], params['Nt'], params['Nr']
-    k_idx = 0 # Assuming we are calculating for user 0
+    k_idx = 0  # Assuming we are calculating for user 0
     
     # Covariance of total transmitted signal from all users
     transmit_covariance = tf.zeros([Nt, Nt], dtype=tf.complex64)
     for i in range(K):
-        transmit_covariance += tf.matmul(V_k_list[i], V_k_list[i], transpose_b=True)
+        transmit_covariance += tf.matmul(V_k_list[i], V_k_list[i], adjoint_b=True)  # Fix this line
         
     # Covariance of received signal y
-    H_k_hermitian = tf.transpose(H_k, conjugate=True)
+    H_k_hermitian = tf.linalg.adjoint(H_k)  # Use adjoint instead of transpose
     R_yy = tf.matmul(H_k, tf.matmul(transmit_covariance, H_k_hermitian))
     noise_cov = tf.cast(noise_variance, dtype=tf.complex64) * tf.eye(Nr, dtype=tf.complex64)
     R_yy += noise_cov
@@ -600,8 +556,12 @@ def mmse_combiner(H_k, V_k_list, noise_variance, params):
     R_ys = tf.matmul(H_k, V_k_list[k_idx])
     
     # MMSE solution: W_hermitian = inv(R_yy) * R_ys
-    W_mmse_hermitian = tf.linalg.solve(R_yy, R_ys)
-    return tf.transpose(W_mmse_hermitian, conjugate=True)
+    try:
+        W_mmse_hermitian = tf.linalg.solve(R_yy, R_ys)
+        return tf.linalg.adjoint(W_mmse_hermitian)
+    except tf.errors.InvalidArgumentError:
+        # Fallback to MRC if MMSE fails
+        return mrc_combiner(H_k, V_k_list[k_idx])
 
 @tf.function(jit_compile=True)
 def run_ber_simulation(combiner, H_k_freq_batch, V_k_list, noise_variance, params, mapper, demapper):
@@ -642,14 +602,14 @@ def run_ber_simulation(combiner, H_k_freq_batch, V_k_list, noise_variance, param
 
     # 4. Pass through channel
     y_freq = tf.einsum('bnts,btf->bnsf', H_k_freq_batch, x_freq_total)
-    y_freq = tf.reduce_mean(y_freq, axis=2)  # Average over subcarriers for simplicity
+    y_freq_flat = tf.reshape(y_freq, [batch_size, params['Nr'], -1])  # Keep all subcarriers
 
     # 5. Add AWGN noise
     noise_stddev = tf.cast(tf.sqrt(noise_variance / 2.0), tf.float32)
-    noise_real = tf.random.normal(tf.shape(y_freq), stddev=noise_stddev)
-    noise_imag = tf.random.normal(tf.shape(y_freq), stddev=noise_stddev)
+    noise_real = tf.random.normal(tf.shape(y_freq_flat), stddev=noise_stddev)
+    noise_imag = tf.random.normal(tf.shape(y_freq_flat), stddev=noise_stddev)
     noise = tf.complex(noise_real, noise_imag)
-    y_freq_noisy = y_freq + noise
+    y_freq_noisy = y_freq_flat + noise
 
     # 6. Apply combiner
     if len(tf.shape(combiner)) == 2:
@@ -890,9 +850,9 @@ def main():
             H_k_batch = H_k_freq_all[start_idx:end_idx]
             state_batch = state_all[start_idx:end_idx]
             
-            # Ensure we have the right number of subcarriers
-            if H_k_batch.shape[-1] > 128:
-                H_k_batch = H_k_batch[..., :128]  # Use first 128 subcarriers
+            # Ensure minimum number of subcarriers for reliable BER estimation
+            min_subcarriers = min(64, H_k_batch.shape[-1])  
+            H_k_batch = H_k_batch[..., :min_subcarriers]
             
             print(f"Batch {i}: Processing {actual_batch_size} samples, H_k shape: {H_k_batch.shape}")
             
