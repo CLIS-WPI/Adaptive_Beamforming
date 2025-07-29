@@ -790,9 +790,7 @@ def main():
     print(f"Trained model weights saved to '{output_dir}' directory.")
 
     # --- 6.4. Evaluation Phase ---
-    # --- Fixed Evaluation Phase ---
     print("\n--- Starting Fixed Evaluation Phase ---")
-
     # Pre-compute channels and states
     print(f"Pre-computing {EVAL_PARAMS['num_channel_realizations']} channel realizations...")
     channel_cache = []
