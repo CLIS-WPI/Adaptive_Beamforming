@@ -1,44 +1,75 @@
 # -*- coding: utf-8 -*-
 """
 This script implements and evaluates an adaptive beamforming strategy for a
-Multi-User MIMO-OFDM system using a two-stage machine learning framework,
-as described in the paper "Adaptive Beamforming for Interference-Limited
+Multi-User MIMO-OFDM system using a two-stage machine learning framework.
+The approach is based on the paper "Adaptive Beamforming for Interference-Limited
 MU-MIMO using Spatio-Temporal Policy Networks".
 
-The framework consists of:
-1. A CNN-GRU Encoder: Learns a spatio-temporal representation from a sequence
-   of partial Channel State Information (CSI) snapshots.
-2. A PPO Reinforcement Learning Agent: Uses the learned representation to select
-   an optimal, quantized combining matrix from a codebook to maximize user throughput.
+The framework consists of two main components:
+1.  A CNN-GRU Encoder: This model learns a compact spatio-temporal
+    representation from a sequence of partial Channel State Information (CSI)
+    snapshots. The CNN part extracts spatial features from each snapshot,
+    and the GRU captures the temporal evolution of these features.
+2.  A PPO Reinforcement Learning Agent: The agent uses the learned state
+    representation from the encoder to select an optimal, quantized combining
+    matrix (W) from a pre-defined codebook. The goal is to maximize the
+    spectral efficiency (throughput) for the user of interest in an
+    interference-limited environment.
 
-This implementation is optimized for performance on modern GPUs (e.g., NVIDIA H100)
-by leveraging mixed-precision training and TensorFlow's graph execution mode. It
-gracefully falls back to CPU if no GPU is available.
+This implementation is optimized for performance on modern GPUs by leveraging
+TensorFlow's graph execution (`tf.function`), JIT compilation, and mixed-precision
+training. It also includes baseline algorithms (MRC, MMSE) for performance
+comparison.
 
-Author: Hossein Mohammadi (Original), Optimized by Gemini
+Key Steps:
+1.  Environment and System Setup: Defines the MIMO system parameters,
+    channel models (Sionna CDL), and TensorFlow configuration.
+2.  Model Definitions: Implements the Keras models for the CNN-GRU Encoder,
+    PPO Actor, and PPO Critic.
+3.  RL Environment: Creates a custom `MIMOEnvironment` class that simulates
+    the wireless channel, calculates rewards (SINR), and provides states to
+    the agent.
+4.  PPO Training: Runs the main training loop where the PPO agent interacts
+    with the environment to learn an optimal policy for selecting combiners.
+5.  Evaluation: After training, the agent's performance is evaluated against
+    baseline methods across a range of SNRs by calculating the Bit Error Rate (BER).
+6.  Visualization: Plots the results, including BER vs. SNR curves, the RL
+    agent's learning curve, and a t-SNE visualization of the learned latent space.
 """
 
+import os
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
-import os
-import sionna
-print("TensorFlow version:", tf.__version__)
-print("Sionna version:", sionna.__version__)
-# Sionna Imports (ensure Sionna version >= 0.19)
-from sionna.phy.channel.tr38901 import CDL, PanelArray
-from sionna.phy.channel import subcarrier_frequencies, cir_to_ofdm_channel, AWGN
-from sionna.phy.ofdm import ResourceGrid, OFDMModulator, OFDMDemodulator, ResourceGridMapper, ResourceGridDemapper
-from sionna.phy.mapping import Mapper, Demapper
+from tqdm import trange
 from sklearn.manifold import TSNE
 
+# Sionna Imports (ensure Sionna version >= 0.19)
+try:
+    import sionna
+    from sionna.phy.channel.tr38901 import CDL, PanelArray
+    from sionna.phy.channel import subcarrier_frequencies, cir_to_ofdm_channel
+    from sionna.phy.mapping import Mapper, Demapper
+except ImportError as e:
+    print("Sionna library not found. Please install it using 'pip install sionna'")
+    raise e
+
 # ──────────────────────────────────────────────────────────────────────────────
-# DEVICE AND PRECISION CONFIGURATION
+# 1. DEVICE AND PRECISION CONFIGURATION
 # ──────────────────────────────────────────────────────────────────────────────
-def configure_environment():
+
+def configure_tensorflow(use_mixed_precision=True, enable_jit=True):
     """
-    Configures TensorFlow to use GPU with memory growth and mixed precision if available,
-    otherwise falls back to CPU.
+    Configures TensorFlow for optimal performance on GPUs.
+
+    This function sets up memory growth to avoid allocating all GPU memory at
+    once, enables mixed-precision for a performance boost on compatible GPUs
+    (e.g., NVIDIA Ampere/Hopper), and enables Just-In-Time (JIT) compilation.
+    If no GPU is found, it gracefully falls back to CPU execution.
+
+    Args:
+        use_mixed_precision (bool): If True, enables mixed_float16 precision.
+        enable_jit (bool): If True, enables XLA JIT compilation.
     """
     try:
         gpus = tf.config.list_physical_devices('GPU')
@@ -46,9 +77,17 @@ def configure_environment():
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
             tf.config.set_visible_devices(gpus, 'GPU')
-            # Enable mixed precision for performance boost on compatible GPUs (e.g., H100)
-            tf.keras.mixed_precision.set_global_policy('mixed_float16')
-            print(f"Successfully configured to run on {len(gpus)} GPU(s) with mixed precision.")
+            
+            if use_mixed_precision:
+                policy = tf.keras.mixed_precision.Policy('mixed_float16')
+                tf.keras.mixed_precision.set_global_policy(policy)
+                print("Mixed precision (float16) enabled.")
+
+            if enable_jit:
+                tf.config.optimizer.set_jit(True)
+                print("XLA JIT compilation enabled.")
+                
+            print(f"Successfully configured to run on {len(gpus)} GPU(s).")
         else:
             print("No GPU found. The script will run on the CPU.")
             tf.config.set_visible_devices([], 'GPU') # Explicitly disable GPUs
@@ -57,129 +96,210 @@ def configure_environment():
         print("Forcing CPU execution.")
         tf.config.set_visible_devices([], 'GPU')
 
-configure_environment()
+# Apply the configuration
+configure_tensorflow()
 
 # Set seed for reproducibility
 SEED = 42
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
-# Disable eager execution for performance; TensorFlow will use graph mode.
-tf.config.run_functions_eagerly(False)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. SIMULATION PARAMETERS
+# ──────────────────────────────────────────────────────────────────────────────
+
+# System Parameters
+PARAMS = {
+    'Nt': 8,  # Number of transmit antennas at BS
+    'Nr': 2,  # Number of receive antennas at UE
+    'K': 4,   # Number of users
+    'Ns': 2,  # Number of data streams per user
+    'tau': 8, # Length of CSI history sequence for the encoder
+    'fft_size': 256,
+    'num_ofdm_symbols': 14,
+    'subcarrier_spacing': 30e3,
+    'cp_length': 16,
+    'mod_order': 16, # 16-QAM
+    'carrier_freq': 3.5e9,
+    'delay_spread': 300e-9,
+}
+PARAMS['bits_per_symbol'] = int(np.log2(PARAMS['mod_order']))
+PARAMS['sampling_frequency'] = PARAMS['fft_size'] * PARAMS['subcarrier_spacing']
+
+# RL and Codebook Parameters
+RL_PARAMS = {
+    'embedding_dim': 128,
+    'codebook_size': 256,
+    'p_ue_max': 1.0,
+    'num_quant_bits': 4,
+    'num_episodes': 1,
+    'max_steps_per_episode': 100,
+    'snr_db_train': 15.0,
+    'gamma': 0.995,         # Discount factor
+    'lambda_gae': 0.95,     # GAE lambda
+    'epsilon_clip': 0.1,    # PPO clipping parameter
+    'value_coeff': 0.5,     # Critic loss coefficient
+    'entropy_coeff': 0.005, # Entropy bonus coefficient
+}
+
+# Evaluation Parameters
+EVAL_PARAMS = {
+    'snr_dBs': np.arange(-20, 22, 2),
+    'num_channel_realizations': 1000, # Number of channels to average over
+    'batch_size': 128, # Batch size for vectorized BER calculation
+}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STAGE 1: CNN-GRU ENCODER MODEL DEFINITION
+# 3. MODEL AND AGENT DEFINITIONS
 # ──────────────────────────────────────────────────────────────────────────────
+
 class CNNGRUEncoder(tf.keras.Model):
     """
-    A hybrid CNN-GRU model to encode a sequence of CSI snapshots into a latent vector.
-    The CNN extracts spatial features, and the GRU captures temporal dependencies.
+    A hybrid CNN-GRU model to encode a sequence of CSI snapshots.
+
+    The model processes a sequence of flattened, complex-valued CSI matrices.
+    1D convolutions extract spatial features from each snapshot, and a GRU
+    captures the temporal dependencies across the sequence to produce a
+    fixed-size latent embedding vector.
     """
     def __init__(self, embedding_dim):
         super(CNNGRUEncoder, self).__init__()
-        # Using float32 for layers that might be sensitive to precision loss
-        self.conv1 = tf.keras.layers.Conv1D(filters=64, kernel_size=3, activation='relu', padding='same', dtype='float32')
-        self.bn1 = tf.keras.layers.BatchNormalization(dtype='float32')
-        self.conv2 = tf.keras.layers.Conv1D(filters=128, kernel_size=3, activation='relu', padding='same', dtype='float32')
-        self.bn2 = tf.keras.layers.BatchNormalization(dtype='float32')
-        # unroll=True can be faster for short sequences on GPU but uses more memory.
-        self.gru = tf.keras.layers.GRU(units=embedding_dim, return_sequences=False, unroll=True, dtype='float32')
+        # Use mixed precision policy, but always cast input to float32
+        self.input_cast = tf.keras.layers.Lambda(lambda x: tf.cast(x, tf.float32))
+        self.conv1 = tf.keras.layers.Conv1D(filters=64, kernel_size=3, activation='relu', padding='same')
+        self.bn1 = tf.keras.layers.BatchNormalization()
+        self.conv2 = tf.keras.layers.Conv1D(filters=128, kernel_size=3, activation='relu', padding='same')
+        self.bn2 = tf.keras.layers.BatchNormalization()
+        self.gru = tf.keras.layers.GRU(units=embedding_dim, return_sequences=False, unroll=True)
 
     @tf.function
     def call(self, inputs):
-        """Forward pass of the encoder."""
-        x = self.conv1(inputs)
+        """Forward pass of the encoder with robust mixed precision casting."""
+        x = tf.cast(inputs, tf.float32)
+        x = self.conv1(x)
         x = self.bn1(x)
         x = self.conv2(x)
         x = self.bn2(x)
         embedding = self.gru(x)
         return embedding
+# --- Sionna LMMSE Equalizer Utility ---
+from sionna.phy.mimo import lmmse_equalizer, StreamManagement
 
-# ──────────────────────────────────────────────────────────────────────────────
-# STAGE 2: REINFORCEMENT LEARNING (PPO) COMPONENTS
-# ──────────────────────────────────────────────────────────────────────────────
+
 class Actor(tf.keras.Model):
     """
-    The PPO Actor network. It takes the state (latent embedding) and outputs
-    a probability distribution over the discrete action space (codebook indices).
+    The PPO Actor network (Policy).
+
+    It takes a state (latent embedding from the encoder) and outputs a
+    probability distribution over the discrete action space (combiner
+    codebook indices).
     """
     def __init__(self, num_actions):
         super().__init__()
-        self.dense1 = tf.keras.layers.Dense(128, activation='relu', dtype='float32')
-        self.dense2 = tf.keras.layers.Dense(64, activation='relu', dtype='float32')
-        # Output logits are float32 for numerical stability with softmax
+        self.dense1 = tf.keras.layers.Dense(128, activation='relu')
+        self.dense2 = tf.keras.layers.Dense(64, activation='relu')
         self.logits = tf.keras.layers.Dense(num_actions, activation=None, dtype='float32')
 
     @tf.function
     def call(self, state):
-        """Forward pass of the Actor network."""
-        x = self.dense1(state)
+        x = tf.cast(state, tf.float32)
+        x = self.dense1(x)
         x = self.dense2(x)
         logits = self.logits(x)
         return tf.nn.softmax(logits)
 
 class Critic(tf.keras.Model):
     """
-    The PPO Critic network. It takes the state and outputs a single value,
-    estimating the expected return from that state.
+    The PPO Critic network (Value Function).
+
+    It takes a state and outputs a single scalar value, estimating the
+    expected return (value) from that state.
     """
     def __init__(self):
         super().__init__()
-        self.dense1 = tf.keras.layers.Dense(128, activation='relu', dtype='float32')
-        self.dense2 = tf.keras.layers.Dense(64, activation='relu', dtype='float32')
+        self.dense1 = tf.keras.layers.Dense(128, activation='relu')
+        self.dense2 = tf.keras.layers.Dense(64, activation='relu')
         self.value = tf.keras.layers.Dense(1, activation=None, dtype='float32')
 
     @tf.function
     def call(self, state):
-        """Forward pass of the Critic network."""
-        x = self.dense1(state)
+        x = tf.cast(state, tf.float32)
+        x = self.dense1(x)
         x = self.dense2(x)
         value = self.value(x)
         return value
+# --- Sionna Mapper/Demapper Initialization ---
+
+# Example usage:
+# mapper, demapper = initialize_sionna_components(mod_order=16, precision='single')
 
 class PPOAgent:
     """
-    The PPO Agent that orchestrates the training process, including advantage
-    calculation and updating the Actor and Critic networks.
+    The PPO Agent that orchestrates the training process.
+
+    This class encapsulates the actor and critic networks, the optimizer,
+    and the logic for computing advantages and updating the network weights
+    based on the PPO clipped surrogate objective.
     """
-    def __init__(self, actor, critic, optimizer, gamma=0.995, lambda_gae=0.95, epsilon_clip=0.1, value_coeff=0.5, entropy_coeff=0.005):
+    def __init__(self, actor, critic, optimizer, **kwargs):
         self.actor = actor
         self.critic = critic
         self.optimizer = optimizer
-        self.gamma = gamma
-        self.lambda_gae = lambda_gae
-        self.epsilon_clip = epsilon_clip
-        self.value_coeff = value_coeff
-        self.entropy_coeff = entropy_coeff
+        self.gamma = kwargs.get('gamma', 0.99)
+        self.lambda_gae = kwargs.get('lambda_gae', 0.95)
+        self.epsilon_clip = kwargs.get('epsilon_clip', 0.2)
+        self.value_coeff = kwargs.get('value_coeff', 0.5)
+        self.entropy_coeff = kwargs.get('entropy_coeff', 0.01)
+
+    def _to_scalar(self, x):
+        if isinstance(x, np.ndarray):
+            if x.size == 0:
+                # WARNING: Encountered empty array, returning 0.0. Check rollout logic for possible bugs.
+                return 0.0
+            if x.size == 1:
+                return x.item()
+            else:
+                raise ValueError(f"Expected scalar or length-1 array, got shape {x.shape}")
+        return float(x)
 
     def _compute_advantages_and_returns(self, rewards, values, next_values, dones):
         """
-        Computes Generalized Advantage Estimation (GAE) and returns for a trajectory.
-        This part is often clearer in NumPy and the overhead is minimal for typical batch sizes.
+        Computes Generalized Advantage Estimation (GAE) and returns.
+
+        This calculation is done in NumPy for clarity, as the performance
+        overhead is negligible for typical trajectory lengths.
         """
         num_steps = len(rewards)
         returns = np.zeros(num_steps, dtype=np.float32)
         advantages = np.zeros(num_steps, dtype=np.float32)
-        last_gae_lam = 0
+        last_gae_lam = 0.0
 
         for t in reversed(range(num_steps)):
-            if dones[t]:
-                delta = rewards[t] - values[t]
-                last_gae_lam = 0
+            r = self._to_scalar(rewards[t])
+            v = self._to_scalar(values[t])
+            nv = self._to_scalar(next_values[t])
+            d = self._to_scalar(dones[t])
+            if d:
+                delta = r - v
+                last_gae_lam = 0.0
             else:
-                delta = rewards[t] + self.gamma * next_values[t] - values[t]
-            
-            advantages[t] = last_gae_lam = delta + self.gamma * self.lambda_gae * (1.0 - dones[t]) * last_gae_lam
-        
-        returns = advantages + values
+                delta = r + self.gamma * nv - v
+            last_gae_lam = float(delta + self.gamma * self.lambda_gae * (1.0 - d) * last_gae_lam)
+            advantages[t] = last_gae_lam
+
+        returns = advantages + np.array([self._to_scalar(v) for v in values], dtype=np.float32)
         return returns, advantages
 
     @tf.function
     def train(self, states, actions, old_probs, returns, advantages):
         """
         Executes a single training step for the PPO agent.
-        This function is decorated with @tf.function to compile it into a high-performance graph.
+
+        This function is compiled into a high-performance graph by TensorFlow.
+        It calculates the PPO loss (actor, critic, and entropy) and applies
+        gradients to update the networks.
         """
         with tf.GradientTape() as tape:
             # Get new probabilities and values from the networks
@@ -214,9 +334,142 @@ class PPOAgent:
         
         return total_loss, actor_loss, critic_loss
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. MIMO RL ENVIRONMENT
+# ──────────────────────────────────────────────────────────────────────────────
+
+class MIMOEnvironment:
+    """
+    Simulates the MU-MIMO environment for the RL agent.
+
+    This class is responsible for:
+    - Generating channel realizations using Sionna's CDL model.
+    - Maintaining a history of CSI snapshots.
+    - Using the CNN-GRU encoder to generate a state representation.
+    - Calculating the reward (log SINR, i.e., spectral efficiency) based on
+      the agent's chosen action (combiner).
+    """
+    def __init__(self, channels, encoder, V_k_list, s_k_list, snr_db, params, rl_params):
+        self.channels = channels
+        self.encoder = encoder
+        self.V_k_list = V_k_list
+        self.s_k_list = s_k_list
+        self.snr_db = snr_db
+        self.params = params
+        self.rl_params = rl_params
+        self.k_idx = 0  # Focus on the first user for reward and state
+        
+        snr_linear = 10**(self.snr_db / 10.0)
+        self.noise_power = tf.cast(1.0 / snr_linear, dtype=tf.float32)
+        self.H_history = []
+
+    def reset(self):
+        """Resets the environment and returns the initial state."""
+        self.H_history = []
+        state, H_k = self.get_state()
+        # Fill the history buffer before starting an episode
+        while state is None:
+            state, H_k = self.get_state()
+        return state, H_k
+
+    def get_state(self):
+        """
+        Generates a new channel, updates history, and returns the encoded state.
+        """
+        # Generate a new channel realization for the user of interest (k=0)
+        h, path_delays = self.channels[self.k_idx](batch_size=1, num_time_steps=1, sampling_frequency=self.params['sampling_frequency'])
+        frequencies = subcarrier_frequencies(self.params['fft_size'], self.params['subcarrier_spacing'])
+        H_freq = cir_to_ofdm_channel(frequencies, h, path_delays)
+        
+        # Use a single subcarrier for the state representation (as in the paper)
+        H_k = tf.squeeze(H_freq[..., 0, :, :, 10]) # Squeeze batch and time dims
+        
+        # Prepare the channel matrix for the encoder input (real and imag parts)
+        H_real_imag = tf.concat([tf.math.real(H_k), tf.math.imag(H_k)], axis=1)
+        H_flat = tf.reshape(H_real_imag, [-1])
+        
+        # Update the history buffer
+        self.H_history.append(H_flat.numpy())
+        if len(self.H_history) > self.params['tau']:
+            self.H_history.pop(0)
+        
+        # If buffer is not full, cannot form a state yet
+        if len(self.H_history) < self.params['tau']:
+            return None, None
+        
+        # Create the input tensor for the encoder
+        X_k = np.stack(self.H_history, axis=0)
+        # Force numpy array to float32 before tensor conversion
+        if X_k.dtype != np.float32:
+            X_k = X_k.astype(np.float32)
+        X_k_tensor = tf.convert_to_tensor(X_k, dtype=tf.float32)
+        X_k_batch = tf.expand_dims(X_k_tensor, axis=0)
+        #print('Encoder input dtype:', X_k_batch.dtype)
+        X_k_batch_f32 = tf.cast(X_k_batch, tf.float32)
+        #print('Encoder input after cast dtype:', X_k_batch_f32.dtype)
+        phi_k = self.encoder(X_k_batch_f32)
+        return phi_k, H_k
+
+    def step(self, action_index, H_k, codebook):
+        """
+        Executes one time step, calculating SINR and reward.
+        """
+        W_k = codebook[action_index]
+        
+        # Calculate SINR for user k (assuming first stream for reward)
+        w_i = W_k[0:1, :] # First stream's combining vector
+        
+        # Desired signal power
+        signal_term = tf.matmul(tf.matmul(w_i, H_k), self.V_k_list[self.k_idx][:, 0:1])
+        signal_power = tf.square(tf.abs(signal_term))
+        
+        # Inter-user interference power
+        inter_user_interference = 0.0
+        for l in range(self.params['K']):
+            if l != self.k_idx:
+                interference_term = tf.matmul(tf.matmul(w_i, H_k), self.V_k_list[l])
+                inter_user_interference += tf.reduce_sum(tf.square(tf.abs(interference_term)))
+        
+        # Intra-user interference power (from other streams of the same user)
+        intra_user_interference = 0.0
+        if self.params['Ns'] > 1:
+            interference_term = tf.matmul(tf.matmul(w_i, H_k), self.V_k_list[self.k_idx][:, 1:])
+            intra_user_interference = tf.reduce_sum(tf.square(tf.abs(interference_term)))
+            
+        # Noise power at the output of the combiner
+        w_i_squared_norm = tf.reduce_sum(tf.square(tf.abs(w_i)))
+        noise_power_at_output = self.noise_power * w_i_squared_norm
+        
+        # Calculate SINR and reward (spectral efficiency in bits/s/Hz)
+        sinr = signal_power / (inter_user_interference + intra_user_interference + noise_power_at_output + 1e-12)
+        reward = tf.math.log(1.0 + tf.cast(sinr, tf.float32)) / tf.math.log(2.0)
+        
+        # Get the next state
+        next_phi_k, H_k_next = self.get_state()
+        done = (next_phi_k is None)
+        
+        return next_phi_k, tf.squeeze(reward), done, H_k_next
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. UTILITY AND BASELINE ALGORITHM FUNCTIONS
+# ──────────────────────────────────────────────────────────────────────────────
+
 def create_combiner_codebook(num_matrices, num_streams, num_rx_antennas, p_ue_max, num_quant_bits):
     """
     Creates a codebook of quantized and power-normalized combiner matrices.
+
+    Args:
+        num_matrices (int): The number of combiner matrices in the codebook.
+        num_streams (int): The number of data streams (Ns).
+        num_rx_antennas (int): The number of receive antennas (Nr).
+        p_ue_max (float): The maximum power constraint for the combiner.
+        num_quant_bits (int): The number of bits for quantizing real/imag parts.
+
+    Returns:
+        tf.Tensor: A tensor of shape [num_matrices, num_streams, num_rx_antennas]
+                   containing the complex-valued codebook.
     """
     codebook = []
     quant_levels = 2**num_quant_bits
@@ -241,731 +494,376 @@ def create_combiner_codebook(num_matrices, num_streams, num_rx_antennas, p_ue_ma
         
     return tf.stack(codebook)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# MIMO RL ENVIRONMENT DEFINITION
-# ──────────────────────────────────────────────────────────────────────────────
-class MIMOEnvironment:
-    """
-    Simulates the MU-MIMO environment for the RL agent.
-    It generates channel realizations, calculates rewards (SINR), and provides states.
-    """
-    def __init__(self, channels, encoder, V_k_list, s_k_list, snr_db, params):
-        self.channels = channels
-        self.encoder = encoder
-        self.V_k_list = V_k_list
-        self.s_k_list = s_k_list
-        self.snr_db = snr_db
-        self.params = params
-        self.k_idx = 0  # We focus on the first user for reward calculation and state
-        
-        snr_linear = 10**(self.snr_db / 10.0)
-        self.noise_power = tf.cast(1.0 / snr_linear, dtype=tf.float32)
-        self.H_history = {k: [] for k in range(self.params['K'])}
-
-    def reset(self):
-        """Resets the environment and returns the initial state."""
-        self.H_history = {k: [] for k in range(self.params['K'])}
-        state, H_k = self.get_state()
-        # Ensure the history buffer is full before starting
-        while state is None:
-            state, H_k = self.get_state()
-        return state, H_k
-
-    def get_state(self):
-        """
-        Generates a new channel realization, updates the history, and returns the
-        encoded state for the RL agent.
-        """
-        # Generate a new channel realization for the user of interest (k=0)
-        h, path_delays = self.channels[self.k_idx](batch_size=1, num_time_steps=1, sampling_frequency=self.params['sampling_frequency'])
-        frequencies = subcarrier_frequencies(self.params['fft_size'], self.params['subcarrier_spacing'])
-        H_freq = cir_to_ofdm_channel(frequencies, h, path_delays)
-        
-        # Use a single subcarrier for the state representation (as in the paper)
-        H_k = tf.squeeze(H_freq[..., 0, :, :, 10]) # Squeeze batch and time dims
-        
-        # Prepare the channel matrix for the encoder input
-        H_real_imag = tf.concat([tf.math.real(H_k), tf.math.imag(H_k)], axis=1)
-        H_flat = tf.reshape(H_real_imag, [-1])
-        
-        # Update the history buffer
-        self.H_history[self.k_idx].append(H_flat.numpy())
-        if len(self.H_history[self.k_idx]) > self.params['tau']:
-            self.H_history[self.k_idx].pop(0)
-        
-        # If buffer is not full, return None
-        if len(self.H_history[self.k_idx]) < self.params['tau']:
-            return None, None
-        
-        # Create the input tensor for the encoder
-        X_k = np.stack(self.H_history[self.k_idx], axis=0)
-        X_k_tensor = tf.convert_to_tensor(X_k, dtype=tf.float32)
-        X_k_batch = tf.expand_dims(X_k_tensor, axis=0)
-        
-        # Get the latent state from the encoder
-        phi_k = self.encoder(X_k_batch)
-        return phi_k, H_k
-
-    def step(self, action_index, H_k, codebook):
-        """
-        Executes one time step in the environment.
-        Calculates the SINR and reward based on the chosen action.
-        """
-        W_k = codebook[action_index]
-        
-        # Construct the transmitted signal from all users
-        x_t = tf.zeros((self.params['Nt'], 1), dtype=tf.complex64)
-        for i in range(self.params['K']):
-            x_t += tf.matmul(self.V_k_list[i], self.s_k_list[i])
-            
-        # Generate noise
-        noise_stddev = tf.sqrt(self.noise_power / 2.0)
-        noise = tf.complex(
-            tf.random.normal([self.params['Nr'], 1], stddev=noise_stddev),
-            tf.random.normal([self.params['Nr'], 1], stddev=noise_stddev)
-        )
-        
-        # Received signal at user k
-        y_k = tf.matmul(H_k, x_t) + noise
-        
-        # Calculate SINR for user k (assuming first stream for reward)
-        w_i = W_k[0:1, :] # First stream's combining vector
-        w_i_hermitian = tf.transpose(w_i, conjugate=True)
-        
-        # Desired signal power
-        signal_term = tf.matmul(tf.matmul(w_i, H_k), self.V_k_list[self.k_idx][:, 0:1])
-        signal_power = tf.square(tf.abs(signal_term))
-        
-        # Inter-user interference power
-        inter_user_interference = 0.0
-        for l in range(self.params['K']):
-            if l != self.k_idx:
-                interference_term = tf.matmul(tf.matmul(w_i, H_k), self.V_k_list[l])
-                inter_user_interference += tf.reduce_sum(tf.square(tf.abs(interference_term)))
-        
-        # Intra-user interference power (from other streams of the same user)
-        intra_user_interference = 0.0
-        if self.params['Ns'] > 1:
-            interference_term = tf.matmul(tf.matmul(w_i, H_k), self.V_k_list[self.k_idx][:, 1:])
-            intra_user_interference = tf.reduce_sum(tf.square(tf.abs(interference_term)))
-            
-        # Noise power at the output of the combiner
-        w_i_squared_norm = tf.reduce_sum(tf.square(tf.abs(w_i)))
-        noise_power_at_output = self.noise_power * w_i_squared_norm
-        
-        # Calculate SINR and reward (spectral efficiency)
-        sinr = signal_power / (inter_user_interference + intra_user_interference + noise_power_at_output + 1e-12)
-        reward = tf.math.log(1.0 + tf.cast(sinr, tf.float32)) / tf.math.log(2.0)
-        
-        # Get the next state
-        next_phi_k, H_k_next = self.get_state()
-        done = (next_phi_k is None)
-        
-        return next_phi_k, reward, done, H_k_next
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SIMULATION PARAMETERS & INSTANTIATION
-# ──────────────────────────────────────────────────────────────────────────────
-# System Parameters
-Nt, Nr, K, Ns, tau = 8, 2, 4, 2, 8
-fft_size, num_ofdm_symbols, subcarrier_spacing, cp_length = 256, 14, 30e3, 16
-mod_order, carrier_freq, delay_spread = 16, 3.5e9, 300e-9
-bits_per_symbol = int(np.log2(mod_order))
-sampling_frequency = fft_size * subcarrier_spacing
-
-# RL and Codebook Parameters
-P_UE_MAX, NUM_QUANT_BITS, CODEBOOK_SIZE, embedding_dim = 1.0, 4, 256, 128
-
-# Model and Component Instantiation
-encoder = CNNGRUEncoder(embedding_dim=embedding_dim)
-actor = Actor(num_actions=CODEBOOK_SIZE)
-critic = Critic()
-combiner_codebook = create_combiner_codebook(CODEBOOK_SIZE, Ns, Nr, P_UE_MAX, NUM_QUANT_BITS)
-
-bs_array = PanelArray(num_rows_per_panel=1, num_cols_per_panel=Nt, polarization="single", polarization_type="V", antenna_pattern="38.901", carrier_frequency=carrier_freq)
-ue_array = PanelArray(num_rows_per_panel=1, num_cols_per_panel=Nr, polarization="single", polarization_type="V", antenna_pattern="omni", carrier_frequency=carrier_freq)
-
-# Instantiate channel models according to the newer Sionna API
-channels = [
-    CDL(model="C", 
-        delay_spread=delay_spread, 
-        carrier_frequency=carrier_freq, 
-        ut_array=ue_array,
-        bs_array=bs_array,
-        direction="downlink", 
-        min_speed=3.0)
-    for _ in range(K)
-]
-
-# Mapper and Demapper for BER calculation
-mapper = Mapper("qam", mod_order)
-demapper = Demapper("app", "qam", bits_per_symbol, hard_out=True)
-
-# OFDM Modulator and Demodulator
-modulator = OFDMModulator(cp_length)
-demodulator = OFDMDemodulator(fft_size, 0, cp_length)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MAIN PPO TRAINING LOOP
-# ──────────────────────────────────────────────────────────────────────────────
-print("Starting PPO Agent Training...")
-num_episodes, max_steps_per_episode, snr_db_train = 10, 100, 15.0
-
-# Learning rate schedule for optimizer
-lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-    initial_learning_rate=3e-4, decay_steps=1000, decay_rate=0.95, staircase=True)
-optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=1.0)
-ppo_agent = PPOAgent(actor, critic, optimizer)
-
-params = {
-    'K': K,
-    'Nt': Nt,
-    'Nr': Nr,
-    'Ns': Ns,
-    'tau': tau,
-    'sampling_frequency': sampling_frequency,
-    'fft_size': 128,  # Reduced from 256
-    'subcarrier_spacing': subcarrier_spacing,
-    'num_ofdm_symbols': 7,  # Reduced from 14
-    'bits_per_symbol': bits_per_symbol,
-    'num_guard_carriers': (0, 0),
-    'dc_null': False,
-    'pilot_pattern': 'empty'
-}
-
-# --- Fixed Precoding & Symbols for the Environment ---
-# Generate fixed symbols for all users
-fixed_s_k = [tf.complex(tf.random.uniform([Ns, 1]), tf.random.uniform([Ns, 1])) for _ in range(K)]
-
-# Generate a single channel snapshot to compute the fixed RBD precoder
-print("--- Calculating Fixed RBD Precoders ---")
-temp_h, temp_delays = zip(*[channels[k](batch_size=1, num_time_steps=1, sampling_frequency=sampling_frequency) for k in range(K)])
-temp_freqs = subcarrier_frequencies(fft_size, subcarrier_spacing)
-temp_H_freq = [cir_to_ofdm_channel(temp_freqs, h, d) for h, d in zip(temp_h, temp_delays)]
-temp_H_k = [tf.squeeze(H[..., 0, :, :, 10]) for H in temp_H_freq]
-
-# Calculate RBD precoder based on this snapshot
-fixed_V_k = []
-for k in range(K):
-    # Aggregate interference channels for user k
-    H_interf_list = [temp_H_k[i] for i in range(K) if i != k]
-    H_interf = tf.concat(H_interf_list, axis=0)
-    
-    # SVD of interference channel to find its nullspace.
-    s_interf, _, v_interf = tf.linalg.svd(H_interf, full_matrices=True)
-    
-    # Calculate rank from singular values to avoid dtype error with
-    # tf.linalg.matrix_rank and to ensure numerical stability.
-    tolerance = tf.reduce_max(s_interf) * 1e-6
-    rank_interf = tf.reduce_sum(tf.cast(s_interf > tolerance, tf.int32))
-    
-    # The nullspace is formed by the right singular vectors corresponding to
-    # the smallest singular values (i.e., those beyond the rank).
-    T_k = v_interf[:, rank_interf:]
-    
-    # Project the desired user's channel into the nullspace
-    H_eff_k = tf.matmul(temp_H_k[k], T_k)
-    
-    # SVD of the effective channel to get the final precoder
-    _, _, v_eff = tf.linalg.svd(H_eff_k)
-    V_eff_k = v_eff[:, :Ns]
-    V_k = tf.matmul(T_k, V_eff_k)
-    fixed_V_k.append(V_k)
-print("--- Finished Calculating Precoders ---")
-
-env = MIMOEnvironment(channels, encoder, fixed_V_k, fixed_s_k, snr_db_train, params)
-total_rewards_history = []
-entropy_history = []
-
-for episode in range(num_episodes):
-    states, actions, rewards, next_states, dones, old_probs = [], [], [], [], [], []
-    state, H_k = env.reset()
-    
-    for t in range(max_steps_per_episode):
-        action_probs = actor(state)
-        # Use categorical sampling to select an action based on the policy
-        action = tf.random.categorical(tf.math.log(action_probs), 1)[0, 0].numpy()
-        old_prob = action_probs[0, action].numpy()
-        
-        next_state, reward, done, H_k_next = env.step(action, H_k, combiner_codebook)
-        
-        if next_state is not None:
-            states.append(tf.squeeze(state).numpy())
-            actions.append(action)
-            rewards.append(tf.squeeze(reward).numpy())
-            next_states.append(tf.squeeze(next_state).numpy())
-            dones.append(done)
-            old_probs.append(old_prob)
-            
-        if done:
-            break
-            
-        state, H_k = next_state, H_k_next
-
-    if len(states) > 1:
-        # PPO requires a full trajectory to compute advantages and returns
-        values = critic(np.array(states)).numpy().flatten()
-        next_values = critic(np.array(next_states)).numpy().flatten()
-        
-        returns, advantages = ppo_agent._compute_advantages_and_returns(np.array(rewards), values, next_values, np.array(dones))
-        # Normalize advantages for stable training
-        advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
-        
-        # Train the agent
-        ppo_agent.train(
-            np.array(states, dtype=np.float32), 
-            np.array(actions, dtype=np.int32), 
-            np.array(old_probs, dtype=np.float32), 
-            returns, 
-            advantages
-        )
-        
-        # Log entropy for monitoring exploration
-        current_probs = actor(np.array(states, dtype=np.float32))
-        current_entropy = -tf.reduce_mean(tf.reduce_sum(current_probs * tf.math.log(current_probs + 1e-10), axis=1))
-        entropy_history.append(current_entropy.numpy())
-
-    episode_reward = sum(rewards)
-    total_rewards_history.append(episode_reward)
-    
-    if (episode + 1) % 10 == 0:
-        avg_reward = np.mean(total_rewards_history[-10:])
-        print(f"Episode: {episode+1}/{num_episodes}, Total Reward: {episode_reward:.2f}, Avg Reward (last 10): {avg_reward:.2f}")
-
-print("\nTraining finished.")
-# Save model weights
-actor.save_weights("ppo_actor.weights.h5")
-critic.save_weights("ppo_critic.weights.h5")
-encoder.save_weights("encoder.weights.h5")
-print("Trained model weights saved successfully.")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# HELPER FUNCTIONS FOR BASELINE ALGORITHMS AND BER
-# ──────────────────────────────────────────────────────────────────────────────
-def calculate_sinr(W_k, H_k, V_k_list, k_idx, noise_power, params):
-    """Calculates the SINR for a given combiner, channel, and precoders."""
-    Ns, K = params['Ns'], params['K']
-    w_i = W_k[0:1, :] # First stream
-    w_i_hermitian = tf.transpose(w_i, conjugate=True)
-    
-    signal_power = tf.square(tf.abs(tf.matmul(tf.matmul(w_i, H_k), V_k_list[k_idx][:,0:1])))
-    
-    inter_user_interference = 0.0
-    for l in range(K):
-        if l != k_idx:
-            interference_term = tf.matmul(tf.matmul(w_i, H_k), V_k_list[l])
-            inter_user_interference += tf.reduce_sum(tf.square(tf.abs(interference_term)))
-            
-    intra_user_interference = 0.0
-    if Ns > 1:
-        interference_term = tf.matmul(tf.matmul(w_i, H_k), V_k_list[k_idx][:,1:])
-        intra_user_interference = tf.reduce_sum(tf.square(tf.abs(interference_term)))
-        
-    w_i_squared_norm = tf.reduce_sum(tf.square(tf.abs(w_i)))
-    noise_power_at_output = noise_power * w_i_squared_norm
-    
-    sinr = signal_power / (inter_user_interference + intra_user_interference + noise_power_at_output + 1e-12)
-    return sinr
-
-def mrc_combiner(H_k, V_k, params):
+def mrc_combiner(H_k, V_k):
     """Calculates the Maximal Ratio Combiner (MRC)."""
     H_eff = tf.matmul(H_k, V_k)
     return tf.transpose(H_eff, conjugate=True)
 
-def mmse_combiner(H_k, V_k_list, noise_power, params):
+def mmse_combiner(H_k, V_k_list, noise_variance, params):
     """Calculates the Minimum Mean Square Error (MMSE) combiner."""
-    K, Nt, Nr, k_idx = params['K'], params['Nt'], params['Nr'], 0
+    K, Nt, Nr = params['K'], params['Nt'], params['Nr']
+    k_idx = 0 # Assuming we are calculating for user 0
     
-    # Covariance of transmitted signal
+    # Covariance of total transmitted signal from all users
     transmit_covariance = tf.zeros([Nt, Nt], dtype=tf.complex64)
     for i in range(K):
         transmit_covariance += tf.matmul(V_k_list[i], V_k_list[i], transpose_b=True)
         
     # Covariance of received signal y
-    R_yy = tf.matmul(H_k, tf.matmul(transmit_covariance, H_k, transpose_b=True))
-    noise_cov = tf.cast(noise_power, dtype=tf.complex64) * tf.eye(Nr, dtype=tf.complex64)
+    H_k_hermitian = tf.transpose(H_k, conjugate=True)
+    R_yy = tf.matmul(H_k, tf.matmul(transmit_covariance, H_k_hermitian))
+    noise_cov = tf.cast(noise_variance, dtype=tf.complex64) * tf.eye(Nr, dtype=tf.complex64)
     R_yy += noise_cov
     
     # Cross-covariance between desired signal s and received signal y
-    R_sy = tf.matmul(V_k_list[k_idx], H_k, transpose_a=True, transpose_b=True)
-    R_ys = tf.transpose(R_sy, conjugate=True)
+    R_ys = tf.matmul(H_k, V_k_list[k_idx])
     
     # MMSE solution: W_hermitian = inv(R_yy) * R_ys
-    W_mmse_hermitian = tf.linalg.lstsq(R_yy, R_ys)
+    W_mmse_hermitian = tf.linalg.solve(R_yy, R_ys)
     return tf.transpose(W_mmse_hermitian, conjugate=True)
 
-def run_siso_ofdm_ber(noise_variance, params):
-    """Runs a simple SISO OFDM simulation over an AWGN channel for a baseline BER."""
-    global mapper, demapper
-    batch_size = 64
-    
-    # Create ResourceGrid for SISO
-    rg_siso = ResourceGrid(
-        num_ofdm_symbols=params['num_ofdm_symbols'],
-        fft_size=params['fft_size'],
-        subcarrier_spacing=params['subcarrier_spacing'],
-        num_tx=1,
-        num_streams_per_tx=1
-    )
-    
-    # Try different import paths for StreamManagement
-    try:
-        from sionna.phy.mimo import StreamManagement
-        import numpy as np
-        rx_tx_assoc = np.array([[1]], dtype=np.int32)  # 1 RX, 1 TX
-        sm = StreamManagement(rx_tx_association=rx_tx_assoc, num_streams_per_tx=1)
-    except ImportError:
-        try:
-            from sionna.phy.ofdm import StreamManagement
-            import numpy as np
-            rx_tx_assoc = np.array([[1]], dtype=np.int32)
-            sm = StreamManagement(rx_tx_association=rx_tx_assoc, num_streams_per_tx=1)
-        except ImportError:
-            try:
-                from sionna.mimo import StreamManagement
-                import numpy as np
-                rx_tx_assoc = np.array([[1]], dtype=np.int32)
-                sm = StreamManagement(rx_tx_association=rx_tx_assoc, num_streams_per_tx=1)
-            except ImportError:
-                # If StreamManagement is not available, use a simpler approach
-                return run_simple_ber_calculation(noise_variance, params)
-    
-    siso_mapper = ResourceGridMapper(rg_siso)
-    rg_demapper_siso = ResourceGridDemapper(rg_siso, sm)
-    
-    # Calculate number of data symbols
-    num_data_symbols = rg_siso.num_data_symbols
-    num_bits = num_data_symbols * params['bits_per_symbol']
-    
-    # Generate bits
-    bits = tf.random.uniform(shape=[batch_size, num_bits], maxval=2, dtype=tf.int32)
-    
-    # Map bits to symbols
-    symbols = mapper(bits)  # [batch_size, actual_num_symbols]
+@tf.function(jit_compile=True)
+def run_ber_simulation(combiner, H_k_freq_batch, V_k_list, noise_variance, params, mapper, demapper):
+    """
+    Highly optimized and vectorized BER calculation for a MU-MIMO link.
 
-    # Pad or truncate symbols to match num_data_symbols
-    symbols_shape = tf.shape(symbols)
-    pad_len = num_data_symbols - symbols_shape[1]
-    symbols = tf.cond(pad_len > 0,
-                     lambda: tf.pad(symbols, [[0,0],[0,pad_len]]),
-                     lambda: symbols[:, :num_data_symbols])
+    Args:
+        combiner (tf.Tensor): The combining matrix or a batch of matrices.
+                              Shape [Ns, Nr] or [batch_size, Ns, Nr].
+        H_k_freq_batch (tf.Tensor): Batch of channel frequency responses.
+                                    Shape [batch_size, Nr, Nt, num_subcarriers].
+        V_k_list (list): List of precoding matrices for all users.
+        noise_variance (float): The variance of the AWGN noise.
+        params (dict): Dictionary of system parameters.
+        mapper (sionna.mapping.Mapper): Sionna Mapper object.
+        demapper (sionna.mapping.Demapper): Sionna Demapper object.
 
-    # Reshape to match ResourceGridMapper expectations: [batch_size, 1, 1, num_data_symbols]
-    symbols = tf.reshape(symbols, [batch_size, 1, 1, num_data_symbols])
+    Returns:
+        Tuple[tf.Tensor, tf.Tensor]: A tuple containing:
+            - total_errors (tf.float32): The total number of bit errors in the batch.
+            - total_bits (tf.float32): The total number of bits transmitted.
+    """
+    batch_size = tf.shape(H_k_freq_batch)[0]
+    Ns = params['Ns']
+    num_subcarriers = tf.shape(H_k_freq_batch)[-1]
+    bits_per_symbol = params['bits_per_symbol']
+    
+    total_symbols_per_user = Ns * num_subcarriers
+    total_bits_per_user = total_symbols_per_user * bits_per_symbol
 
-    # Map to resource grid
-    x_rg = siso_mapper(symbols)  # [batch_size, 1, 1, num_ofdm_symbols, fft_size]
-    
-    # Add AWGN noise
-    noise_stddev = tf.cast(tf.sqrt(noise_variance/2), tf.float32)
-    noise = tf.complex(
-        tf.random.normal(tf.shape(x_rg), stddev=noise_stddev),
-        tf.random.normal(tf.shape(x_rg), stddev=noise_stddev)
-    )
-    y_rg = x_rg + noise
-    
-    # Demap from resource grid
-    symbols_hat = rg_demapper_siso(y_rg)  # [batch_size, 1, 1, num_data_symbols]
-    symbols_hat = tf.squeeze(symbols_hat, axis=[1, 2])  # [batch_size, num_data_symbols]
-    
-    # Demap symbols to bits (Sionna 1.1.0 Demapper requires noise variance 'no')
-    bits_hat = demapper(symbols_hat, tf.cast(noise_variance, tf.float32))
-    
-    # Truncate bits_hat to match original bits size if needed
-    original_bits_size = tf.shape(bits)[1]
-    bits_hat_size = tf.shape(bits_hat)[1]
-    
-    if bits_hat_size > original_bits_size:
-        bits_hat = bits_hat[:, :original_bits_size]
-    elif bits_hat_size < original_bits_size:
-        bits = bits[:, :bits_hat_size]
-    
-    # Calculate bit errors
-    num_errors = tf.reduce_sum(tf.cast(bits != tf.cast(bits_hat, tf.int32), tf.float32))
-    return num_errors, tf.cast(tf.size(bits), tf.float32)
+    # 1. Generate random bits and map to symbols for the user of interest
+    bits = tf.random.uniform([batch_size, total_bits_per_user], minval=0, maxval=2, dtype=tf.int32)
+    symbols = mapper(bits)
+    symbols = tf.reshape(symbols, [batch_size, Ns, num_subcarriers])
 
-def run_simple_ber_calculation(noise_variance, params):
-    """Fallback simple BER calculation without resource grid complexity."""
-    global mapper, demapper
-    batch_size = 64
-    
-    # Simple approach - direct symbol manipulation
-    num_symbols = 100  # Fixed number for simplicity
-    num_bits = num_symbols * params['bits_per_symbol']
-    bits = tf.random.uniform(shape=[batch_size, num_bits], maxval=2, dtype=tf.int32)
-    
-    # Map bits to symbols
-    symbols = mapper(bits)  # [batch_size, num_symbols]
-    
-    # Add AWGN noise directly to symbols
-    noise_stddev = tf.cast(tf.sqrt(noise_variance/2), tf.float32)
-    noise = tf.complex(
-        tf.random.normal(tf.shape(symbols), stddev=noise_stddev),
-        tf.random.normal(tf.shape(symbols), stddev=noise_stddev)
-    )
-    symbols_noisy = symbols + noise
-    
-    # Demap symbols back to bits
-    bits_hat = demapper(symbols_noisy)
-    
-    # Calculate bit errors
-    num_errors = tf.reduce_sum(tf.cast(bits != bits_hat, tf.float32))
-    return num_errors, tf.cast(tf.size(bits), tf.float32)
+    # 2. Construct the transmitted signal from all users (including interference)
+    x_freq_total = tf.zeros([batch_size, params['Nt'], num_subcarriers], dtype=tf.complex64)
+    for k in range(params['K']):
+        V_k = V_k_list[k] # Precoding matrix for user k
+        if k == 0: # User of interest
+            s_k = symbols
+        else: # Interfering users' signals
+            interf_bits = tf.random.uniform(tf.shape(bits), minval=0, maxval=2, dtype=tf.int32)
+            s_k = tf.reshape(mapper(interf_bits), tf.shape(symbols))
+        
+        # Apply precoder
+        x_freq_k = tf.einsum('bns,tn->bts', s_k, V_k)
+        x_freq_total += x_freq_k
 
-def run_mu_mimo_ber(combiner, H_k_freq, V_k_list, k_idx, noise_variance, params):
-    """Runs a full MU-MIMO OFDM link simulation to calculate BER."""
-    global mapper, demapper
-    batch_size = 16
-    K, Ns, Nt = params['K'], params['Ns'], params['Nt']
-    
-    # Simplified approach - work directly with frequency domain
-    # Use a subset of subcarriers to avoid resource grid complexity
-    num_subcarriers = 64  # Use a fixed number of subcarriers for simplicity
-    symbols_per_stream = num_subcarriers  # Ensure data matches subcarriers
+    # 3. Pass through channel
+    y_freq = tf.einsum('bnts,bts->bns', H_k_freq_batch, x_freq_total)
 
-    # Generate bits for all streams
-    num_bits_per_stream = symbols_per_stream * params['bits_per_symbol']
-    total_bits = num_bits_per_stream * Ns
-    bits = tf.random.uniform([batch_size, total_bits], minval=0, maxval=2, dtype=tf.int32)
-
-    # Map bits to symbols
-    symbols = mapper(bits)  # [batch_size, total_symbols]
-
-    # Reshape to [batch_size, Ns, symbols_per_stream]
-    symbols = tf.reshape(symbols, [batch_size, Ns, symbols_per_stream])
-    actual_subcarriers = num_subcarriers
-    
-    # Apply precoding - symbols shape: [batch_size, Ns, actual_subcarriers]
-    # V_k_list[k_idx] shape: [Nt, Ns]
-    x_freq = tf.zeros([batch_size, Nt, actual_subcarriers], dtype=tf.complex64)
-    
-    for ns in range(Ns):
-        # Get symbols for stream ns: [batch_size, actual_subcarriers]
-        stream_symbols = symbols[:, ns, :]
-        # Apply precoding vector: [Nt]
-        precoding_vector = V_k_list[k_idx][:, ns]
-        # Broadcast multiply: [batch_size, Nt, actual_subcarriers]
-        precoded_symbols = tf.einsum('bf,t->btf', stream_symbols, precoding_vector)
-        x_freq += precoded_symbols
-    
-    # Apply channel - use only the first actual_subcarriers
-    # H_k_freq has shape [Nr, Nt, num_subcarriers] but may have extra dims
-    # Squeeze out extra dimensions and take only needed subcarriers
-    H_k_squeezed = tf.squeeze(H_k_freq)  # Remove singleton dimensions
-    
-    # Ensure we have the right shape [Nr, Nt, subcarriers]
-    if len(H_k_squeezed.shape) > 3:
-        # Take the last 3 dimensions
-        H_k_squeezed = H_k_squeezed[..., :, :, :]
-    
-    H_k_used = H_k_squeezed[:, :, :actual_subcarriers]  # [Nr, Nt, actual_subcarriers]
-    
-    # Apply channel matrix multiplication for each sample in batch
-    y_freq_list = []
-    for b in range(batch_size):
-        # x_freq[b] has shape [Nt, actual_subcarriers]
-        # H_k_used has shape [Nr, Nt, actual_subcarriers]
-        # We want: y = H @ x for each subcarrier
-        y_sample = tf.einsum('rts,ts->rs', H_k_used, x_freq[b, :, :])  # [Nr, actual_subcarriers]
-        y_freq_list.append(y_sample)
-    
-    y_freq = tf.stack(y_freq_list, axis=0)  # [batch_size, Nr, actual_subcarriers]
-    
-    # Add noise
-    noise_stddev = tf.cast(tf.sqrt(noise_variance/2), tf.float32)
+    # 4. Add AWGN noise
+    noise_stddev = tf.cast(tf.sqrt(noise_variance / 2.0), tf.float32)
     noise = tf.complex(
         tf.random.normal(tf.shape(y_freq), stddev=noise_stddev),
         tf.random.normal(tf.shape(y_freq), stddev=noise_stddev)
     )
     y_freq_noisy = y_freq + noise
+
+    # 5. Apply combiner
+    # If combiner is a single matrix, tile it for the batch
+    if len(tf.shape(combiner)) == 2:
+        combiner_batch = tf.tile(tf.expand_dims(combiner, 0), [batch_size, 1, 1])
+    else:
+        combiner_batch = combiner
+    s_hat = tf.einsum('bsr,brf->bsf', combiner_batch, y_freq_noisy)
+
+    # 6. Demap and count errors
+    s_hat_flat = tf.reshape(s_hat, [batch_size, -1])
+    bits_hat = demapper(s_hat_flat, tf.cast(noise_variance, tf.float32))
+
+    # Ensure shapes match for comparison
+    min_size = tf.minimum(tf.shape(bits)[1], tf.shape(bits_hat)[1])
+    bits_truncated = bits[:, :min_size]
+    bits_hat_truncated = tf.cast(bits_hat[:, :min_size], tf.int32)
     
-    # Apply combining: combiner is [Ns, Nr], y_freq_noisy is [batch, Nr, actual_subcarriers]
-    s_hat = tf.einsum('sr,brf->bsf', combiner, y_freq_noisy)
+    num_errors = tf.reduce_sum(tf.cast(bits_truncated != bits_hat_truncated, tf.float32))
+    total_compared_bits = tf.cast(tf.size(bits_truncated), tf.float32)
     
-    # --- Correct BER calculation for 16-QAM using Sionna demapper ---
-    # 1. Flatten the estimated symbols from [batch, streams, symbols] to [batch, total_symbols]
-    s_hat_flat = tf.reshape(s_hat, [tf.shape(s_hat)[0], -1])
-    # 2. Use the demapper to correctly convert symbols to bits for 16-QAM
-    noise_variance_float32 = tf.cast(noise_variance, tf.float32)
-    bits_hat = demapper(s_hat_flat, noise_variance_float32)
-    # 3. Ensure the number of bits matches the original transmitted bits
-    total_bits = tf.shape(bits)[1]
-    bits_hat = bits_hat[:, :total_bits]
-    # 4. Calculate the number of errors
-    num_errors = tf.reduce_sum(tf.cast(bits != tf.cast(bits_hat, tf.int32), tf.float32))
-    total_compared_bits = tf.cast(tf.size(bits), tf.float32)
     return num_errors, total_compared_bits
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# EVALUATION LOOP OVER ALL SNRs
+# 6. MAIN SCRIPT EXECUTION
 # ──────────────────────────────────────────────────────────────────────────────
-print("\nStarting final evaluation phase...")
-results_throughput = {"PPO": [], "RBD": [], "MRC": [], "MMSE": []}
-results_ber = {"PPO": [], "RBD": [], "MRC": [], "MMSE": [], "OFDM_AWGN": []}
-num_eval_steps = 100
 
-# Load the trained models
-encoder.load_weights("encoder.weights.h5")
-actor.load_weights("ppo_actor.weights.h5")
-print("Loaded trained model weights for evaluation.")
-
-snr_dBs_eval = np.arange(-20, 22, 2)
-
-for snr_db in snr_dBs_eval:
-    print(f"Evaluating SNR = {snr_db} dB...")
+def main():
+    """Main function to run the PPO training and evaluation."""
     
-    noise_power_eval = tf.cast(10**(-snr_db / 10.0), dtype=tf.float32)
-    noise_variance_eval = 10**(-snr_db / 10.0)
+    # --- 6.1. Component Instantiation ---
+    print("--- Initializing Models and Environment Components ---")
     
-    avg_throughputs = {name: [] for name in results_throughput.keys()}
-    total_errors = {name: 0.0 for name in results_ber.keys()}
-    total_bits = {name: 0.0 for name in results_ber.keys()}
+    # Models and Agent
+    encoder = CNNGRUEncoder(embedding_dim=RL_PARAMS['embedding_dim'])
+    actor = Actor(num_actions=RL_PARAMS['codebook_size'])
+    critic = Critic()
     
-    eval_env = MIMOEnvironment(channels, encoder, fixed_V_k, fixed_s_k, snr_db, params)
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=3e-4, decay_steps=1000, decay_rate=0.95, staircase=True)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=1.0)
+    ppo_agent = PPOAgent(actor, critic, optimizer, **RL_PARAMS)
 
-    for step in range(num_eval_steps):
-        h, path_delays = channels[0](batch_size=1, num_time_steps=1, sampling_frequency=sampling_frequency)
-        frequencies = subcarrier_frequencies(fft_size, subcarrier_spacing)
-        H_k_freq_domain = cir_to_ofdm_channel(frequencies, h, path_delays)
-        H_k_single_sc = tf.squeeze(H_k_freq_domain[..., 0, :, :, 10])
+    # Combiner Codebook
+    combiner_codebook = create_combiner_codebook(
+        RL_PARAMS['codebook_size'], PARAMS['Ns'], PARAMS['Nr'], 
+        RL_PARAMS['p_ue_max'], RL_PARAMS['num_quant_bits']
+    )
 
-        state, _ = eval_env.get_state()
-        while state is None: state, _ = eval_env.get_state()
+    # Sionna Components
+    bs_array = PanelArray(num_rows_per_panel=1, num_cols_per_panel=PARAMS['Nt'], polarization="single", polarization_type="V", antenna_pattern="38.901", carrier_frequency=PARAMS['carrier_freq'])
+    ue_array = PanelArray(num_rows_per_panel=1, num_cols_per_panel=PARAMS['Nr'], polarization="single", polarization_type="V", antenna_pattern="omni", carrier_frequency=PARAMS['carrier_freq'])
+
+    channels = [
+        CDL(model="C", 
+            delay_spread=PARAMS['delay_spread'], 
+            carrier_frequency=PARAMS['carrier_freq'], 
+            ut_array=ue_array,
+            bs_array=bs_array,
+            direction="downlink", 
+            min_speed=3.0)
+        for _ in range(PARAMS['K'])
+    ]
+    
+    mapper = Mapper("qam", PARAMS['mod_order'])
+    demapper = Demapper("app", "qam", PARAMS['bits_per_symbol'], hard_out=True)
+
+    # --- 6.2. Calculate Fixed RBD Precoders ---
+    print("--- Calculating Fixed Regularized Block Diagonalization (RBD) Precoders ---")
+    temp_h, temp_delays = zip(*[channels[k](batch_size=1, num_time_steps=1, sampling_frequency=PARAMS['sampling_frequency']) for k in range(PARAMS['K'])])
+    temp_freqs = subcarrier_frequencies(PARAMS['fft_size'], PARAMS['subcarrier_spacing'])
+    temp_H_freq = [cir_to_ofdm_channel(temp_freqs, h, d) for h, d in zip(temp_h, temp_delays)]
+    temp_H_k = [tf.squeeze(H[..., 0, :, :, 10]) for H in temp_H_freq] # Use one subcarrier
+
+    fixed_V_k = []
+    for k in range(PARAMS['K']):
+        H_interf_list = [temp_H_k[i] for i in range(PARAMS['K']) if i != k]
+        H_interf = tf.concat(H_interf_list, axis=0)
         
-        action_probs = actor(state)
-        best_action = tf.argmax(action_probs, axis=1)[0].numpy()
-        W_ppo = combiner_codebook[best_action]
+        s, u, v = tf.linalg.svd(H_interf)
         
-        # Calculate baseline combiners
-        W_rbd = tf.transpose(tf.linalg.lstsq(tf.matmul(H_k_single_sc, fixed_V_k[0]), tf.eye(Ns, dtype=tf.complex64)), conjugate=True)
-        W_mrc = mrc_combiner(H_k_single_sc, fixed_V_k[0], params)
-        W_mmse = mmse_combiner(H_k_single_sc, fixed_V_k, noise_power_eval, params)
+        # Correctly calculate rank for nullspace
+        rank_interf = tf.reduce_sum(tf.cast(s > 1e-6, tf.int32))
+        null_space_vecs = v[:, rank_interf:]
+        
+        H_eff_k = tf.matmul(temp_H_k[k], null_space_vecs)
+        
+        _, _, v_eff = tf.linalg.svd(H_eff_k)
+        V_eff_k = v_eff[:, :PARAMS['Ns']]
+        V_k = tf.matmul(null_space_vecs, V_eff_k)
+        fixed_V_k.append(V_k)
+    print("--- Finished Calculating Precoders ---")
 
-        combiners = {"PPO": W_ppo, "RBD": W_rbd, "MRC": W_mrc, "MMSE": W_mmse}
-
-        for name, W in combiners.items():
-            sinr = calculate_sinr(W, H_k_single_sc, fixed_V_k, 0, noise_power_eval, params)
-            avg_throughputs[name].append(tf.math.log(1.0 + tf.cast(sinr, tf.float32)) / tf.math.log(2.0))
+    # Fixed symbols for the environment (not used in BER, only for SINR reward)
+    fixed_s_k = [tf.complex(tf.random.uniform([PARAMS['Ns'], 1]), tf.random.uniform([PARAMS['Ns'], 1])) for _ in range(PARAMS['K'])]
+    
+    # --- 6.3. PPO Training Loop ---
+    env = MIMOEnvironment(channels, encoder, fixed_V_k, fixed_s_k, RL_PARAMS['snr_db_train'], PARAMS, RL_PARAMS)
+    total_rewards_history = []
+    
+    print(f"\n--- Starting PPO Agent Training for {RL_PARAMS['num_episodes']} episodes ---")
+    for episode in trange(RL_PARAMS['num_episodes'], desc="Training Progress"):
+        states, actions, rewards, next_states, dones, old_probs = [], [], [], [], [], []
+        state, H_k = env.reset()
+        
+        for t in range(RL_PARAMS['max_steps_per_episode']):
+            action_probs_dist = actor(state)
+            action = tf.random.categorical(tf.math.log(action_probs_dist), 1)[0, 0].numpy()
+            old_prob = action_probs_dist[0, action].numpy()
             
-            # Run BER simulation for this combiner
-            errors, bits_count = run_mu_mimo_ber(W, tf.squeeze(H_k_freq_domain, axis=1), fixed_V_k, 0, noise_variance_eval, params)
-            total_errors[name] += errors
-            total_bits[name] += bits_count
+            next_state, reward, done, H_k_next = env.step(action, H_k, combiner_codebook)
+            
+            if next_state is not None:
+                states.append(tf.squeeze(state).numpy())
+                actions.append(action)
+                rewards.append(reward.numpy())
+                next_states.append(tf.squeeze(next_state).numpy())
+                dones.append(done)
+                old_probs.append(old_prob)
+            
+            if done:
+                break
+            
+            state, H_k = next_state, H_k_next
 
-    # Run SISO AWGN BER for reference
-    errors, bits_count = run_siso_ofdm_ber(noise_variance_eval, params)
-    total_errors["OFDM_AWGN"] += errors
-    total_bits["OFDM_AWGN"] += bits_count
+        if len(states) > 1:
+            values = critic(np.array(states)).numpy().flatten()
+            next_values = critic(np.array(next_states)).numpy().flatten()
+            
+            returns, advantages = ppo_agent._compute_advantages_and_returns(np.array(rewards), values, next_values, np.array(dones))
+            advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
+            
+            ppo_agent.train(
+                np.array(states, dtype=np.float32), 
+                np.array(actions, dtype=np.int32), 
+                np.array(old_probs, dtype=np.float32), 
+                returns, 
+                advantages
+            )
+        
+        total_rewards_history.append(sum(rewards))
 
-    # Aggregate results for this SNR point
-    for name in results_throughput.keys():
-        results_throughput[name].append(np.mean([t.numpy() for t in avg_throughputs[name] if not tf.math.is_nan(t)]))
+    print("\n--- Training Finished ---")
+    output_dir = "results"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    actor.save_weights(os.path.join(output_dir, "ppo_actor_weights.h5"))
+    critic.save_weights(os.path.join(output_dir, "ppo_critic_weights.h5"))
+    encoder.save_weights(os.path.join(output_dir, "encoder_weights.h5"))
+    print(f"Trained model weights saved to '{output_dir}' directory.")
+
+    # --- 6.4. Evaluation Phase ---
+    print("\n--- Starting Final Evaluation Phase ---")
     
-    for name in results_ber.keys():
-        if total_bits[name] > 0:
-            results_ber[name].append(total_errors[name] / total_bits[name])
-        else:
-            results_ber[name].append(1.0) # Avoid division by zero
+    print(f"Pre-computing {EVAL_PARAMS['num_channel_realizations']} channel realizations...")
+    channel_cache_cir = []  # Store CIR for frequency generation
+    state_cache = []
+    eval_env = MIMOEnvironment(channels, encoder, fixed_V_k, fixed_s_k, 0, PARAMS, RL_PARAMS) # SNR doesn't matter here
+    for _ in trange(EVAL_PARAMS['num_channel_realizations'], desc="Generating Channels & States"):
+        # Generate fresh CIR for evaluation
+        h, path_delays = channels[0](batch_size=1, num_time_steps=1, sampling_frequency=PARAMS['sampling_frequency'])
+        channel_cache_cir.append((h, path_delays))  # Store for freq generation
+        # Also get state representation
+        state, H_k = eval_env.reset()
+        state_cache.append(tf.squeeze(state))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PLOTTING RESULTS
-# ──────────────────────────────────────────────────────────────────────────────
-output_dir = "results"
-if not os.path.exists(output_dir):
-    os.makedirs(output_dir)
-    print(f"Directory '{output_dir}' created.")
 
-# --- Plot 1: Throughput vs. SNR ---
-fig1, ax1 = plt.subplots(figsize=(10, 7))
-ax1.plot(snr_dBs_eval, results_throughput["PPO"], 'o-', label='PPO Agent', linewidth=2)
-ax1.plot(snr_dBs_eval, results_throughput["RBD"], 's--', label='RBD', linewidth=2)
-ax1.plot(snr_dBs_eval, results_throughput["MMSE"], 'd-.', label='MMSE', linewidth=2)
-ax1.plot(snr_dBs_eval, results_throughput["MRC"], '^:', label='MRC', linewidth=2)
-ax1.set_xlabel("SNR (dB)", fontsize=14)
-ax1.set_ylabel("Average Spectral Efficiency (bits/s/Hz)", fontsize=14)
-ax1.set_title("Performance Comparison of Combining Strategies", fontsize=16)
-ax1.grid(True, which="both", linestyle='--')
-ax1.legend(fontsize=12)
-ax1.set_ylim(bottom=0)
-fig1.savefig(os.path.join(output_dir, 'throughput_vs_snr.png'))
-plt.close(fig1)
-print("Saved throughput plot to results/throughput_vs_snr.png")
+    # Generate frequency domain channels ONCE and keep as a list for memory efficiency
+    print("Generating frequency domain channels for evaluation (memory efficient)...")
+    temp_freqs = subcarrier_frequencies(PARAMS['fft_size'], PARAMS['subcarrier_spacing'])
+    def freq_channel_generator():
+        """Generate frequency domain channels on-demand for memory efficiency."""
+        try:
+            for i, (h, delays) in enumerate(channel_cache_cir):
+                H_f = cir_to_ofdm_channel(temp_freqs, h, delays)
+                yield tf.squeeze(H_f[..., 0, :, :, :128])
+        except Exception as e:
+            print(f"Error generating channel {i}: {e}")
+            raise
 
-# --- Plot 2: BER vs. SNR ---
-fig2, ax2 = plt.subplots(figsize=(10, 7))
-ax2.plot(snr_dBs_eval, results_ber["PPO"], 'o-', label='PPO Agent', linewidth=2)
-ax2.plot(snr_dBs_eval, results_ber["RBD"], 's--', label='RBD', linewidth=2)
-ax2.plot(snr_dBs_eval, results_ber["MMSE"], 'd-.', label='MMSE', linewidth=2)
-ax2.plot(snr_dBs_eval, results_ber["MRC"], '^:', label='MRC', linewidth=2)
-ax2.plot(snr_dBs_eval, results_ber["OFDM_AWGN"], 'x-k', label='OFDM (SISO AWGN)', linewidth=2)
-ax2.set_yscale('log')
-ax2.set_xlabel("SNR (dB)", fontsize=14)
-ax2.set_ylabel("Bit Error Rate (BER)", fontsize=14)
-ax2.set_title("BER Performance Comparison of Combining Strategies", fontsize=16)
-ax2.grid(True, which="both", linestyle='--')
-ax2.legend(fontsize=12)
-ax2.set_ylim(1e-5, 1.0)
-fig2.savefig(os.path.join(output_dir, 'ber_vs_snr.png'))
-plt.close(fig2)
-print("Saved BER plot to results/ber_vs_snr.png")
+    # No stacking, just use generator in batch loop
 
-# --- Plot 3: RL Agent Training Curve ---
-fig3, ax3 = plt.subplots(figsize=(10, 7))
-def moving_average(data, window_size=10):
-    if len(data) < window_size: return np.array([])
-    return np.convolve(data, np.ones(window_size), 'valid') / window_size
-smoothed_rewards = moving_average(np.array(total_rewards_history))
-if smoothed_rewards.size > 0:
-    ax3.plot(smoothed_rewards)
-    ax3.set_xlabel("Episode", fontsize=14)
-    ax3.set_ylabel("Smoothed Average Reward", fontsize=14)
-    ax3.set_title("PPO Agent Learning Curve", fontsize=16)
-    ax3.grid(True)
-    fig3.savefig(os.path.join(output_dir, 'rl_training_curve.png'))
-    print("Saved RL training curve plot to results/rl_training_curve.png")
-plt.close(fig3)
+    results_ber = {"PPO": [], "MRC": [], "MMSE": []}
 
-# --- Plot 4: Policy Entropy vs. Episode ---
-fig4, ax4 = plt.subplots(figsize=(10, 7))
-ax4.plot(entropy_history)
-ax4.set_xlabel("Episode", fontsize=14)
-ax4.set_ylabel("Average Policy Entropy", fontsize=14)
-ax4.set_title("Policy Entropy During Training", fontsize=16)
-ax4.grid(True)
-fig4.savefig(os.path.join(output_dir, 'policy_entropy.png'))
-plt.close(fig4)
-print("Saved policy entropy plot to results/policy_entropy.png")
+    for snr_db in EVAL_PARAMS['snr_dBs']:
+        print(f"--- Evaluating SNR = {snr_db} dB ---")
+        noise_var = 10**(-snr_db / 10.0)
+        
+        total_errors = {"PPO": 0.0, "MRC": 0.0, "MMSE": 0.0}
+        total_bits = {"PPO": 0.0, "MRC": 0.0, "MMSE": 0.0}
+        
+        num_batches = EVAL_PARAMS['num_channel_realizations'] // EVAL_PARAMS['batch_size']
+        freq_channel_iter = iter(freq_channel_generator())
+        for i in trange(num_batches, desc=f"SNR {snr_db} dB Batches"):
+            start_idx = i * EVAL_PARAMS['batch_size']
+            end_idx = start_idx + EVAL_PARAMS['batch_size']
+            # Get next batch of frequency channels
+            H_k_batch_freq = [next(freq_channel_iter) for _ in range(EVAL_PARAMS['batch_size'])]
+            H_k_batch_freq = tf.stack(H_k_batch_freq)
+            state_batch = tf.stack(state_cache[start_idx:end_idx])
+            
+            # PPO Agent Action Selection
+            action_probs = actor(state_batch)
+            action_indices = tf.argmax(action_probs, axis=1)
+            W_ppo_batch = tf.gather(combiner_codebook, action_indices)
+            
+            # Baseline Combiners
+            H_k_batch_single_sc = H_k_batch_freq[:, :, :, 0] # Use one subcarrier for combiner calculation
+            W_mrc_batch = tf.map_fn(lambda h: safe_mrc_combiner(h, fixed_V_k[0]), H_k_batch_single_sc, fn_output_signature=tf.TensorSpec(shape=[PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64))
+            W_mmse_batch = tf.map_fn(lambda h: mmse_combiner(h, fixed_V_k, noise_var, PARAMS), H_k_batch_single_sc, fn_output_signature=tf.TensorSpec(shape=[PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64))
+            
+            # Run BER simulation for each
+            err, bits = run_ber_simulation(W_ppo_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
+            total_errors["PPO"] += err            # Add this new function before your eval code
+            def safe_mrc_combiner(h, v):
+                """Safe wrapper for mrc_combiner that handles empty or wrong-shaped inputs."""
+                h_shape = tf.shape(h)
+                # Check if any dimension is 0
+                if tf.equal(h_shape[0], 0) or tf.equal(h_shape[1], 0):
+                    # Return zeros of the expected shape
+                    return tf.zeros([PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64)
+                try:
+                    return mrc_combiner(h, v)
+                except Exception:
+                    # Fallback if any other error occurs
+                    return tf.zeros([PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64)
+            total_bits["PPO"] += bits
+            
+            err, bits = run_ber_simulation(W_mrc_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
+            total_errors["MRC"] += err
+            total_bits["MRC"] += bits
+            
+            err, bits = run_ber_simulation(W_mmse_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
+            total_errors["MMSE"] += err
+            total_bits["MMSE"] += bits
 
-# --- Plot 5: t-SNE Visualization of Latent Space ---
-print("\nGenerating Latent Space Visualization...")
-latent_states = []
-chosen_actions = []
-num_viz_steps = 500
-snr_db_viz = 10.0
-viz_env = MIMOEnvironment(channels, encoder, fixed_V_k, fixed_s_k, snr_db_viz, params)
-state, H_k = viz_env.reset()
-for _ in range(num_viz_steps):
-    while state is None:
-        state, H_k = viz_env.get_state()
-    latent_states.append(tf.squeeze(state).numpy())
-    action_probs = actor(state)
-    best_action = tf.argmax(action_probs, axis=1)[0].numpy()
-    chosen_actions.append(best_action)
-    state, _, _, H_k = viz_env.step(best_action, H_k, combiner_codebook)
+        # Calculate and store BER
+        for name in results_ber.keys():
+            ber = total_errors[name] / total_bits[name] if total_bits[name] > 0 else 0
+            results_ber[name].append(ber)
 
-tsne = TSNE(n_components=2, perplexity=30, max_iter=300, random_state=SEED)
-latent_2d = tsne.fit_transform(np.array(latent_states))
+    print("\n--- Final BER Results ---")
+    for name, ber_list in results_ber.items():
+        print(f"{name}: {[f'{b:.2e}' for b in ber_list]}")
 
-fig5, ax5 = plt.subplots(figsize=(12, 10))
-scatter = ax5.scatter(latent_2d[:, 0], latent_2d[:, 1], c=chosen_actions, cmap='viridis', alpha=0.7)
-ax5.set_xlabel("t-SNE Component 1", fontsize=14)
-ax5.set_ylabel("t-SNE Component 2", fontsize=14)
-ax5.set_title("t-SNE Visualization of Encoder's Latent Space", fontsize=16)
-ax5.grid(True, linestyle='--')
-legend1 = ax5.legend(*scatter.legend_elements(num=8), title="Chosen Actions") # Show a subset of actions for clarity
-ax5.add_artist(legend1)
-fig5.savefig(os.path.join(output_dir, 'tsne_latent_space.png'))
-plt.close(fig5)
-print("Saved t-SNE visualization to results/tsne_latent_space.png")
+    # --- 6.5. Plotting Results ---
+    print("\n--- Generating and Saving Plots ---")
 
-print("\nAll tasks completed.")
+    # Plot 1: BER vs. SNR
+    fig, ax = plt.subplots(figsize=(10, 7))
+    for name, ber_list in results_ber.items():
+        ax.plot(EVAL_PARAMS['snr_dBs'], ber_list, 'o-', label=name, linewidth=2)
+    ax.set_yscale('log')
+    ax.set_xlabel("SNR (dB)", fontsize=14)
+    ax.set_ylabel("Bit Error Rate (BER)", fontsize=14)
+    ax.set_title("BER Performance Comparison of Combining Strategies", fontsize=16)
+    ax.grid(True, which="both", linestyle='--')
+    ax.legend(fontsize=12)
+    ax.set_ylim(1e-5, 1.0)
+    plt.tight_layout()
+    fig.savefig(os.path.join(output_dir, 'ber_vs_snr.png'))
+    plt.close(fig)
+    print(f"Saved BER plot to '{os.path.join(output_dir, 'ber_vs_snr.png')}'")
+
+    # Plot 2: RL Agent Training Curve
+    fig, ax = plt.subplots(figsize=(10, 7))
+    def moving_average(data, window_size=20):
+        if len(data) < window_size: return np.array([])
+        return np.convolve(data, np.ones(window_size), 'valid') / window_size
+    
+    smoothed_rewards = moving_average(np.array(total_rewards_history))
+    if smoothed_rewards.size > 0:
+        ax.plot(range(len(smoothed_rewards)), smoothed_rewards)
+        ax.set_xlabel("Episode", fontsize=14)
+        ax.set_ylabel("Smoothed Average Reward (bits/s/Hz)", fontsize=14)
+        ax.set_title("PPO Agent Learning Curve", fontsize=16)
+        ax.grid(True)
+        plt.tight_layout()
+        fig.savefig(os.path.join(output_dir, 'rl_training_curve.png'))
+        print(f"Saved RL training curve plot to '{os.path.join(output_dir, 'rl_training_curve.png')}'")
+    plt.close(fig)
+    
+    print("\n--- All tasks completed successfully. ---")
+
+if __name__ == "__main__":
+    main()

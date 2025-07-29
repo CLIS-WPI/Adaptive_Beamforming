@@ -17,7 +17,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN python3 -m pip install --no-cache-dir --upgrade \
     'sionna' \
     'matplotlib' \
-    'scikit-learn'
+    'scikit-learn'\
+    'tqdm'
 
 # --- Copy Project Files ---
 # Copy the main simulation script into the workspace
