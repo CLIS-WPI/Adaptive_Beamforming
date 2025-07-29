@@ -606,83 +606,78 @@ def mmse_combiner(H_k, V_k_list, noise_variance, params):
 @tf.function(jit_compile=True)
 def run_ber_simulation(combiner, H_k_freq_batch, V_k_list, noise_variance, params, mapper, demapper):
     """
-    Highly optimized and vectorized BER calculation for a MU-MIMO link.
-
-    Args:
-        combiner (tf.Tensor): The combining matrix or a batch of matrices.
-                              Shape [Ns, Nr] or [batch_size, Ns, Nr].
-        H_k_freq_batch (tf.Tensor): Batch of channel frequency responses.
-                                    Shape [batch_size, Nr, Nt, num_subcarriers].
-        V_k_list (list): List of precoding matrices for all users.
-        noise_variance (float): The variance of the AWGN noise.
-        params (dict): Dictionary of system parameters.
-        mapper (sionna.mapping.Mapper): Sionna Mapper object.
-        demapper (sionna.mapping.Demapper): Sionna Demapper object.
-
-    Returns:
-        Tuple[tf.Tensor, tf.Tensor]: A tuple containing:
-            - total_errors (tf.float32): The total number of bit errors in the batch.
-            - total_bits (tf.float32): The total number of bits transmitted.
+    Fixed BER calculation with proper error detection.
     """
     batch_size = tf.shape(H_k_freq_batch)[0]
     Ns = params['Ns']
     num_subcarriers = tf.shape(H_k_freq_batch)[-1]
     bits_per_symbol = params['bits_per_symbol']
     
+    # Calculate total bits more carefully
     total_symbols_per_user = Ns * num_subcarriers
     total_bits_per_user = total_symbols_per_user * bits_per_symbol
 
-    # 1. Generate random bits and map to symbols for the user of interest
+    # 1. Generate random bits for the user of interest
     bits = tf.random.uniform([batch_size, total_bits_per_user], minval=0, maxval=2, dtype=tf.int32)
-    symbols = mapper(bits)
+    
+    # 2. Map bits to symbols
+    symbols = mapper(bits)  # Shape: [batch_size, total_symbols_per_user]
     symbols = tf.reshape(symbols, [batch_size, Ns, num_subcarriers])
 
-    # 2. Construct the transmitted signal from all users (including interference)
+    # 3. Construct transmitted signal from all users
     x_freq_total = tf.zeros([batch_size, params['Nt'], num_subcarriers], dtype=tf.complex64)
+    
     for k in range(params['K']):
-        V_k = V_k_list[k] # Precoding matrix for user k
-        if k == 0: # User of interest
+        V_k = V_k_list[k]
+        if k == 0:  # User of interest
             s_k = symbols
-        else: # Interfering users' signals
-            interf_bits = tf.random.uniform(tf.shape(bits), minval=0, maxval=2, dtype=tf.int32)
-            s_k = tf.reshape(mapper(interf_bits), tf.shape(symbols))
+        else:  # Interfering users
+            interf_bits = tf.random.uniform([batch_size, total_bits_per_user], minval=0, maxval=2, dtype=tf.int32)
+            s_k_interf = mapper(interf_bits)
+            s_k = tf.reshape(s_k_interf, [batch_size, Ns, num_subcarriers])
         
-        # Apply precoder
-        x_freq_k = tf.einsum('bns,tn->bts', s_k, V_k)
+        # Apply precoder: x_k = V_k * s_k
+        x_freq_k = tf.einsum('ns,bsf->bnf', V_k, s_k)  # [batch_size, Nt, num_subcarriers]
         x_freq_total += x_freq_k
 
-    # 3. Pass through channel
-    y_freq = tf.einsum('bnts,bts->bns', H_k_freq_batch, x_freq_total)
+    # 4. Pass through channel
+    y_freq = tf.einsum('bnts,btf->bnsf', H_k_freq_batch, x_freq_total)
+    y_freq = tf.reduce_mean(y_freq, axis=2)  # Average over subcarriers for simplicity
 
-    # 4. Add AWGN noise
+    # 5. Add AWGN noise
     noise_stddev = tf.cast(tf.sqrt(noise_variance / 2.0), tf.float32)
-    noise = tf.complex(
-        tf.random.normal(tf.shape(y_freq), stddev=noise_stddev),
-        tf.random.normal(tf.shape(y_freq), stddev=noise_stddev)
-    )
+    noise_real = tf.random.normal(tf.shape(y_freq), stddev=noise_stddev)
+    noise_imag = tf.random.normal(tf.shape(y_freq), stddev=noise_stddev)
+    noise = tf.complex(noise_real, noise_imag)
     y_freq_noisy = y_freq + noise
 
-    # 5. Apply combiner
-    # If combiner is a single matrix, tile it for the batch
+    # 6. Apply combiner
     if len(tf.shape(combiner)) == 2:
         combiner_batch = tf.tile(tf.expand_dims(combiner, 0), [batch_size, 1, 1])
     else:
         combiner_batch = combiner
+    
+    # Combining: s_hat = W^H * y
     s_hat = tf.einsum('bsr,brf->bsf', combiner_batch, y_freq_noisy)
-
-    # 6. Demap and count errors
     s_hat_flat = tf.reshape(s_hat, [batch_size, -1])
-    bits_hat = demapper(s_hat_flat, tf.cast(noise_variance, tf.float32))
 
-    # Ensure shapes match for comparison
-    min_size = tf.minimum(tf.shape(bits)[1], tf.shape(bits_hat)[1])
-    bits_truncated = bits[:, :min_size]
-    bits_hat_truncated = tf.cast(bits_hat[:, :min_size], tf.int32)
+    # 7. Demap symbols back to bits
+    # **CRITICAL FIX**: Use proper noise variance for demapping
+    demapped_llrs = demapper([s_hat_flat, tf.cast(noise_variance, tf.float32)])
+    bits_hat = tf.cast(demapped_llrs > 0, tf.int32)  # Hard decision
+
+    # 8. Count bit errors - **CRITICAL FIX**
+    # Ensure both tensors have the same shape
+    min_bits = tf.minimum(tf.shape(bits)[1], tf.shape(bits_hat)[1])
+    bits_truncated = bits[:, :min_bits]
+    bits_hat_truncated = bits_hat[:, :min_bits]
     
-    num_errors = tf.reduce_sum(tf.cast(bits_truncated != bits_hat_truncated, tf.float32))
-    total_compared_bits = tf.cast(tf.size(bits_truncated), tf.float32)
+    # Count errors
+    errors = tf.cast(tf.not_equal(bits_truncated, bits_hat_truncated), tf.float32)
+    total_errors = tf.reduce_sum(errors)
+    total_bits = tf.cast(batch_size * min_bits, tf.float32)
     
-    return num_errors, total_compared_bits
+    return total_errors, total_bits
 
 
 # ──────────────────────────────────────────────────────────────────────────────
