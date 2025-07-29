@@ -45,7 +45,15 @@ print(f"TensorFlow Version: {tf.__version__}")
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import trange
-from sklearn.manifold import TSNE
+
+# Optional import for visualization
+try:
+    from sklearn.manifold import TSNE
+    TSNE_AVAILABLE = True
+except ImportError:
+    print("Warning: sklearn not installed. t-SNE visualization will be disabled.")
+    print("To install: pip install scikit-learn")
+    TSNE_AVAILABLE = False
 
 # Sionna Imports (ensure Sionna version >= 0.19)
 try:
@@ -992,39 +1000,25 @@ def main():
     plt.close(fig)
 
     # Plot 4: t-SNE Latent Space Visualization
-    try:
-        from sklearn.manifold import TSNE
-        tsne = TSNE(n_components=2, random_state=42)
-        state_matrix = np.stack([s.numpy() if hasattr(s, 'numpy') else s for s in state_cache])
-        tsne_embeds = tsne.fit_transform(state_matrix)
-        fig, ax = plt.subplots(figsize=(10, 7))
-        ax.scatter(tsne_embeds[:, 0], tsne_embeds[:, 1], s=10, alpha=0.7)
-        ax.set_title("t-SNE of Latent State Embeddings", fontsize=16)
-        ax.set_xlabel("t-SNE Dim 1", fontsize=14)
-        ax.set_ylabel("t-SNE Dim 2", fontsize=14)
-        plt.tight_layout()
-        fig.savefig(os.path.join(output_dir, 'tsne_latent_space.png'))
-        print(f"Saved t-SNE latent space plot to '{os.path.join(output_dir, 'tsne_latent_space.png')}'")
-        plt.close(fig)
-    except Exception as e:
-        print(f"t-SNE plot could not be generated: {e}")
-    # Plot 4: t-SNE Latent Space Visualization
-    try:
-        from sklearn.manifold import TSNE
-        tsne = TSNE(n_components=2, random_state=42)
-        state_matrix = np.stack([s.numpy() if hasattr(s, 'numpy') else s for s in state_cache])
-        tsne_embeds = tsne.fit_transform(state_matrix)
-        fig, ax = plt.subplots(figsize=(10, 7))
-        ax.scatter(tsne_embeds[:, 0], tsne_embeds[:, 1], s=10, alpha=0.7)
-        ax.set_title("t-SNE of Latent State Embeddings", fontsize=16)
-        ax.set_xlabel("t-SNE Dim 1", fontsize=14)
-        ax.set_ylabel("t-SNE Dim 2", fontsize=14)
-        plt.tight_layout()
-        fig.savefig(os.path.join(output_dir, 'tsne_latent_space.png'))
-        print(f"Saved t-SNE latent space plot to '{os.path.join(output_dir, 'tsne_latent_space.png')}'")
-        plt.close(fig)
-    except Exception as e:
-        print(f"t-SNE plot could not be generated: {e}")
+    if TSNE_AVAILABLE:
+        try:
+            state_matrix = np.stack([s.numpy() if hasattr(s, 'numpy') else s for s in state_cache])
+            tsne = TSNE(n_components=2, random_state=42)
+            tsne_embeds = tsne.fit_transform(state_matrix)
+            
+            fig, ax = plt.subplots(figsize=(10, 7))
+            ax.scatter(tsne_embeds[:, 0], tsne_embeds[:, 1], s=10, alpha=0.7)
+            ax.set_title("t-SNE of Latent State Embeddings", fontsize=16)
+            ax.set_xlabel("t-SNE Dim 1", fontsize=14)
+            ax.set_ylabel("t-SNE Dim 2", fontsize=14)
+            plt.tight_layout()
+            fig.savefig(os.path.join(output_dir, 'tsne_latent_space.png'))
+            print(f"Saved t-SNE latent space plot to '{os.path.join(output_dir, 'tsne_latent_space.png')}'")
+            plt.close(fig)
+        except Exception as e:
+            print(f"t-SNE plot could not be generated: {e}")
+    else:
+        print("Skipping t-SNE visualization - scikit-learn not installed")
     # -*- coding: utf-8 -*-
 
     print("\n--- All tasks completed successfully. ---")
