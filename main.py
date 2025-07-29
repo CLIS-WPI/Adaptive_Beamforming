@@ -160,6 +160,10 @@ def configure_tensorflow(use_mixed_precision=True, enable_jit=True, memory_growt
                     'pin_to_host_optimization': True,
                     'implementation_selector': True
                 }
+                # Add auto mixed precision to XLA options if needed
+                if use_mixed_precision:
+                    xla_options['auto_mixed_precision'] = True
+                
                 # Apply XLA options
                 tf.config.optimizer.set_experimental_options(xla_options)
                 print("XLA JIT compilation enabled with optimizations")
@@ -168,9 +172,6 @@ def configure_tensorflow(use_mixed_precision=True, enable_jit=True, memory_growt
             if auto_tune:
                 os.environ['TF_CUDNN_USE_AUTOTUNE'] = '1'
                 print("cuDNN auto-tuning enabled")
-                    'auto_mixed_precision': use_mixed_precision,
-                })
-                print("Enhanced XLA JIT compilation enabled.")
             
             # Enable GPU growth and optimize memory allocation
             tf.config.experimental.enable_op_determinism()
@@ -436,7 +437,13 @@ class CNNGRUEncoder(tf.keras.Model):
         
         return embedding
 # --- Sionna LMMSE Equalizer Utility ---
-from sionna.phy.mimo import lmmse_equalizer, StreamManagement
+try:
+    from sionna.phy.mimo import lmmse_equalizer, StreamManagement
+    SIONNA_MIMO_AVAILABLE = True
+except ImportError:
+    print("Warning: sionna.phy.mimo module not found. LMMSE equalizer will not be available.")
+    print("Make sure you have Sionna version >= 0.19")
+    SIONNA_MIMO_AVAILABLE = False
 
 
 class Actor(tf.keras.Model):
@@ -1162,7 +1169,22 @@ def main():
             )
         
         total_rewards_history.append(sum(rewards))
+        
+        # Display performance statistics every 10 episodes
+        if episode % 10 == 0:
+            actor_stats = performance_monitor.get_stats("actor_inference")
+            if actor_stats["count"] > 0:
+                print(f"Actor throughput: {actor_stats['throughput']:.2f} inferences/sec")
+                print(f"Average inference time: {actor_stats['avg_duration']*1000:.2f} ms")
 
+    # Print final performance statistics
+    print("\n--- Training Performance Summary ---")
+    actor_stats = performance_monitor.get_stats("actor_inference")
+    print(f"Actor model performance:")
+    print(f"- Average throughput: {actor_stats['throughput']:.2f} inferences/sec")
+    print(f"- Average latency: {actor_stats['avg_duration']*1000:.2f} ms")
+    print(f"- Total inferences profiled: {actor_stats['count']}")
+    
     print("\n--- Training Finished ---")
     output_dir = "results"
     if not os.path.exists(output_dir):
