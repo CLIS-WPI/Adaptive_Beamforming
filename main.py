@@ -568,6 +568,14 @@ def run_ber_simulation(combiner, H_k_freq_batch, V_k_list, noise_variance, param
     """
     Fixed BER calculation with proper error detection.
     """
+    # Input validation
+    if tf.shape(H_k_freq_batch)[0] == 0:
+        return tf.constant(0.0), tf.constant(1.0)
+    
+    if noise_variance <= 0:
+        print("Warning: Invalid noise variance, using default")
+        noise_variance = 1e-6
+    
     batch_size = tf.shape(H_k_freq_batch)[0]
     Ns = params['Ns']
     num_subcarriers = tf.shape(H_k_freq_batch)[-1]
@@ -888,6 +896,11 @@ def main():
                             combiner_batch, H_k_batch, fixed_V_k, noise_var, PARAMS, mapper, demapper
                         )
                         
+                        # Check for NaN or invalid results
+                        if tf.math.is_nan(errors) or tf.math.is_nan(bits) or bits == 0:
+                            print(f"  {method_name}: Invalid result, skipping...")
+                            continue
+                            
                         total_errors[method_name] += float(errors.numpy())
                         total_bits[method_name] += float(bits.numpy())
                         
