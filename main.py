@@ -495,9 +495,73 @@ def create_combiner_codebook(num_matrices, num_streams, num_rx_antennas, p_ue_ma
     return tf.stack(codebook)
 
 def mrc_combiner(H_k, V_k):
-    """Calculates the Maximal Ratio Combiner (MRC)."""
+    """
+    Calculates the Maximal Ratio Combiner (MRC).
+    
+    Args:
+        H_k: Channel matrix [Nr, Nt]
+        V_k: Precoding matrix [Nt, Ns]
+    
+    Returns:
+        W_k: Combining matrix [Ns, Nr]
+    """
+    # Effective channel after precoding: [Nr, Ns]
     H_eff = tf.matmul(H_k, V_k)
-    return tf.transpose(H_eff, conjugate=True)
+    
+    # MRC: conjugate transpose of effective channel
+    W_k = tf.linalg.adjoint(H_eff)  # [Ns, Nr]
+    
+    # Normalize each combiner to unit power (following Sionna convention)
+    norm = tf.sqrt(tf.reduce_sum(tf.abs(W_k)**2, axis=-1, keepdims=True))
+    W_k = tf.math.divide_no_nan(W_k, tf.cast(norm, W_k.dtype))
+    
+    return W_k
+
+def mmse_combiner(H_k, V_k_list, noise_variance, params):
+    """
+    Calculates the Minimum Mean Square Error (MMSE) combiner.
+    
+    Args:
+        H_k: Channel matrix [Nr, Nt]
+        V_k_list: List of precoding matrices for all users
+        noise_variance: Noise variance (scalar)
+        params: System parameters
+    
+    Returns:
+        W_k: MMSE combining matrix [Ns, Nr]
+    """
+    Nr, Nt = params['Nr'], params['Nt']
+    Ns = params['Ns']
+    k_idx = 0  # User of interest
+    
+    # Build interference covariance matrix
+    interference_cov = tf.zeros([Nr, Nr], dtype=tf.complex64)
+    
+    for i, V_i in enumerate(V_k_list):
+        H_eff_i = tf.matmul(H_k, V_i)  # [Nr, Ns]
+        if i == k_idx:
+            # Store desired channel for later
+            H_desired = H_eff_i
+        else:
+            # Add interference contribution
+            interference_cov += tf.matmul(H_eff_i, H_eff_i, adjoint_b=True)
+    
+    # Add noise covariance
+    noise_cov = tf.cast(noise_variance, dtype=tf.complex64) * tf.eye(Nr, dtype=tf.complex64)
+    total_cov = interference_cov + noise_cov
+    
+    # MMSE solution: W^H = (H_desired * (total_cov)^-1)^H
+    try:
+        # Use Cholesky decomposition for numerical stability (following Sionna pattern)
+        L = tf.linalg.cholesky(total_cov)
+        W_mmse_h = tf.linalg.cholesky_solve(L, H_desired)
+        W_k = tf.linalg.adjoint(W_mmse_h)  # [Ns, Nr]
+    except tf.errors.InvalidArgumentError:
+        # Fallback to regular solve if Cholesky fails
+        W_mmse_h = tf.linalg.solve(total_cov, H_desired)
+        W_k = tf.linalg.adjoint(W_mmse_h)  # [Ns, Nr]
+    
+    return W_k
 
 def mmse_combiner(H_k, V_k_list, noise_variance, params):
     """Calculates the Minimum Mean Square Error (MMSE) combiner."""
