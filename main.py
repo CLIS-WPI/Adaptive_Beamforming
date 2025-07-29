@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+
 """
 This script implements and evaluates an adaptive beamforming strategy for a
 Multi-User MIMO-OFDM system using a two-stage machine learning framework.
@@ -133,7 +133,7 @@ RL_PARAMS = {
     'codebook_size': 256,
     'p_ue_max': 1.0,
     'num_quant_bits': 4,
-    'num_episodes': 1,
+    'num_episodes': 2000,
     'max_steps_per_episode': 100,
     'snr_db_train': 15.0,
     'gamma': 0.995,         # Discount factor
@@ -142,6 +142,11 @@ RL_PARAMS = {
     'value_coeff': 0.5,     # Critic loss coefficient
     'entropy_coeff': 0.005, # Entropy bonus coefficient
 }
+
+# Place safe_mrc_combiner after RL_PARAMS
+def safe_mrc_combiner(h, v):
+    """Safe wrapper for mrc_combiner that handles empty or wrong-shaped inputs."""
+    h_shape = tf.shape(h)
 
 # Evaluation Parameters
 EVAL_PARAMS = {
@@ -744,6 +749,7 @@ def main():
     # --- 6.3. PPO Training Loop ---
     env = MIMOEnvironment(channels, encoder, fixed_V_k, fixed_s_k, RL_PARAMS['snr_db_train'], PARAMS, RL_PARAMS)
     total_rewards_history = []
+    policy_entropy_history = []
     
     print(f"\n--- Starting PPO Agent Training for {RL_PARAMS['num_episodes']} episodes ---")
     for episode in trange(RL_PARAMS['num_episodes'], desc="Training Progress"):
@@ -754,9 +760,13 @@ def main():
             action_probs_dist = actor(state)
             action = tf.random.categorical(tf.math.log(action_probs_dist), 1)[0, 0].numpy()
             old_prob = action_probs_dist[0, action].numpy()
-            
+
+            # Calculate and store policy entropy for this step
+            entropy = -np.sum(action_probs_dist.numpy() * np.log(action_probs_dist.numpy() + 1e-10))
+            policy_entropy_history.append(entropy)
+
             next_state, reward, done, H_k_next = env.step(action, H_k, combiner_codebook)
-            
+
             if next_state is not None:
                 states.append(tf.squeeze(state).numpy())
                 actions.append(action)
@@ -764,10 +774,10 @@ def main():
                 next_states.append(tf.squeeze(next_state).numpy())
                 dones.append(done)
                 old_probs.append(old_prob)
-            
+
             if done:
                 break
-            
+
             state, H_k = next_state, H_k_next
 
         if len(states) > 1:
@@ -858,19 +868,7 @@ def main():
             
             # Run BER simulation for each
             err, bits = run_ber_simulation(W_ppo_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
-            total_errors["PPO"] += err            # Add this new function before your eval code
-            def safe_mrc_combiner(h, v):
-                """Safe wrapper for mrc_combiner that handles empty or wrong-shaped inputs."""
-                h_shape = tf.shape(h)
-                # Check if any dimension is 0
-                if tf.equal(h_shape[0], 0) or tf.equal(h_shape[1], 0):
-                    # Return zeros of the expected shape
-                    return tf.zeros([PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64)
-                try:
-                    return mrc_combiner(h, v)
-                except Exception:
-                    # Fallback if any other error occurs
-                    return tf.zeros([PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64)
+            total_errors["PPO"] += err
             total_bits["PPO"] += bits
             
             err, bits = run_ber_simulation(W_mrc_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
@@ -914,7 +912,7 @@ def main():
     def moving_average(data, window_size=20):
         if len(data) < window_size: return np.array([])
         return np.convolve(data, np.ones(window_size), 'valid') / window_size
-    
+
     smoothed_rewards = moving_average(np.array(total_rewards_history))
     if smoothed_rewards.size > 0:
         ax.plot(range(len(smoothed_rewards)), smoothed_rewards)
@@ -926,7 +924,58 @@ def main():
         fig.savefig(os.path.join(output_dir, 'rl_training_curve.png'))
         print(f"Saved RL training curve plot to '{os.path.join(output_dir, 'rl_training_curve.png')}'")
     plt.close(fig)
-    
+
+    # Plot 3: Policy Entropy Curve
+    fig, ax = plt.subplots(figsize=(10, 7))
+    entropy_ma = moving_average(np.array(policy_entropy_history), window_size=20)
+    if entropy_ma.size > 0:
+        ax.plot(range(len(entropy_ma)), entropy_ma)
+        ax.set_xlabel("Step", fontsize=14)
+        ax.set_ylabel("Policy Entropy", fontsize=14)
+        ax.set_title("Policy Entropy During Training", fontsize=16)
+        ax.grid(True)
+        plt.tight_layout()
+        fig.savefig(os.path.join(output_dir, 'policy_entropy.png'))
+        print(f"Saved policy entropy plot to '{os.path.join(output_dir, 'policy_entropy.png')}'")
+
+    plt.close(fig)
+
+    # Plot 4: t-SNE Latent Space Visualization
+    try:
+        from sklearn.manifold import TSNE
+        tsne = TSNE(n_components=2, random_state=42)
+        state_matrix = np.stack([s.numpy() if hasattr(s, 'numpy') else s for s in state_cache])
+        tsne_embeds = tsne.fit_transform(state_matrix)
+        fig, ax = plt.subplots(figsize=(10, 7))
+        ax.scatter(tsne_embeds[:, 0], tsne_embeds[:, 1], s=10, alpha=0.7)
+        ax.set_title("t-SNE of Latent State Embeddings", fontsize=16)
+        ax.set_xlabel("t-SNE Dim 1", fontsize=14)
+        ax.set_ylabel("t-SNE Dim 2", fontsize=14)
+        plt.tight_layout()
+        fig.savefig(os.path.join(output_dir, 'tsne_latent_space.png'))
+        print(f"Saved t-SNE latent space plot to '{os.path.join(output_dir, 'tsne_latent_space.png')}'")
+        plt.close(fig)
+    except Exception as e:
+        print(f"t-SNE plot could not be generated: {e}")
+    # Plot 4: t-SNE Latent Space Visualization
+    try:
+        from sklearn.manifold import TSNE
+        tsne = TSNE(n_components=2, random_state=42)
+        state_matrix = np.stack([s.numpy() if hasattr(s, 'numpy') else s for s in state_cache])
+        tsne_embeds = tsne.fit_transform(state_matrix)
+        fig, ax = plt.subplots(figsize=(10, 7))
+        ax.scatter(tsne_embeds[:, 0], tsne_embeds[:, 1], s=10, alpha=0.7)
+        ax.set_title("t-SNE of Latent State Embeddings", fontsize=16)
+        ax.set_xlabel("t-SNE Dim 1", fontsize=14)
+        ax.set_ylabel("t-SNE Dim 2", fontsize=14)
+        plt.tight_layout()
+        fig.savefig(os.path.join(output_dir, 'tsne_latent_space.png'))
+        print(f"Saved t-SNE latent space plot to '{os.path.join(output_dir, 'tsne_latent_space.png')}'")
+        plt.close(fig)
+    except Exception as e:
+        print(f"t-SNE plot could not be generated: {e}")
+    # -*- coding: utf-8 -*-
+
     print("\n--- All tasks completed successfully. ---")
 
 if __name__ == "__main__":
