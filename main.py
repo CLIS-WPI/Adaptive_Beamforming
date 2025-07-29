@@ -858,13 +858,39 @@ def main():
         total_errors = {"PPO": 0.0, "MRC": 0.0, "MMSE": 0.0}
         total_bits = {"PPO": 0.0, "MRC": 0.0, "MMSE": 0.0}
         
-        num_batches = EVAL_PARAMS['num_channel_realizations'] // EVAL_PARAMS['batch_size']
+        # Calculate number of batches with ceiling division to handle all samples
+        total_samples = EVAL_PARAMS['num_channel_realizations']
+        batch_size = EVAL_PARAMS['batch_size']
+        num_batches = (total_samples + batch_size - 1) // batch_size  # Ceiling division
+        
+        print(f"Processing {total_samples} samples in {num_batches} batches")
+        
+        if num_batches == 0:
+            print("WARNING: No batches to process!")
+            # Add zeros to results and continue to next SNR
+            for name in results_ber.keys():
+                results_ber[name].append(0.0)
+            continue
+            
         freq_channel_iter = iter(freq_channel_generator())
         for i in trange(num_batches, desc=f"SNR {snr_db} dB Batches"):
             start_idx = i * EVAL_PARAMS['batch_size']
-            end_idx = start_idx + EVAL_PARAMS['batch_size']
+            end_idx = min(start_idx + EVAL_PARAMS['batch_size'], total_samples)
+            batch_size_actual = end_idx - start_idx
+            
             # Get next batch of frequency channels
-            H_k_batch_freq = [next(freq_channel_iter) for _ in range(EVAL_PARAMS['batch_size'])]
+            H_k_batch_freq = []
+            for _ in range(batch_size_actual):
+                try:
+                    H_k_batch_freq.append(next(freq_channel_iter))
+                except StopIteration:
+                    print(f"WARNING: Ran out of channels at batch {i}, item {len(H_k_batch_freq)}")
+                    break
+            
+            if len(H_k_batch_freq) == 0:
+                print(f"WARNING: Empty batch at index {i}")
+                continue
+                
             H_k_batch_freq = tf.stack(H_k_batch_freq)
             state_batch = tf.stack(state_cache[start_idx:end_idx])
             
@@ -875,25 +901,45 @@ def main():
             
             # Baseline Combiners
             H_k_batch_single_sc = H_k_batch_freq[:, :, :, 0] # Use one subcarrier for combiner calculation
-            W_mrc_batch = tf.map_fn(lambda h: safe_mrc_combiner(h, fixed_V_k[0]), H_k_batch_single_sc, fn_output_signature=tf.TensorSpec(shape=[PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64))
-            W_mmse_batch = tf.map_fn(lambda h: mmse_combiner(h, fixed_V_k, noise_var, PARAMS), H_k_batch_single_sc, fn_output_signature=tf.TensorSpec(shape=[PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64))
             
-            # Run BER simulation for each
-            err, bits = run_ber_simulation(W_ppo_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
-            total_errors["PPO"] += err
-            total_bits["PPO"] += bits
-            
-            err, bits = run_ber_simulation(W_mrc_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
-            total_errors["MRC"] += err
-            total_bits["MRC"] += bits
-            
-            err, bits = run_ber_simulation(W_mmse_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
-            total_errors["MMSE"] += err
-            total_bits["MMSE"] += bits
+            try:
+                W_mrc_batch = tf.map_fn(
+                    lambda h: safe_mrc_combiner(h, fixed_V_k[0]), 
+                    H_k_batch_single_sc, 
+                    fn_output_signature=tf.TensorSpec(shape=[PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64)
+                )
+                
+                W_mmse_batch = tf.map_fn(
+                    lambda h: mmse_combiner(h, fixed_V_k, noise_var, PARAMS), 
+                    H_k_batch_single_sc, 
+                    fn_output_signature=tf.TensorSpec(shape=[PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64)
+                )
+                
+                # Run BER simulation for each
+                err, bits = run_ber_simulation(W_ppo_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
+                total_errors["PPO"] += err
+                total_bits["PPO"] += bits
+                
+                err, bits = run_ber_simulation(W_mrc_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
+                total_errors["MRC"] += err
+                total_bits["MRC"] += bits
+                
+                err, bits = run_ber_simulation(W_mmse_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
+                total_errors["MMSE"] += err
+                total_bits["MMSE"] += bits
+                
+            except Exception as e:
+                print(f"Error processing batch {i}: {e}")
+                continue
 
         # Calculate and store BER
         for name in results_ber.keys():
-            ber = total_errors[name] / total_bits[name] if total_bits[name] > 0 else 0
+            if total_bits[name] > 0:
+                ber = total_errors[name] / total_bits[name]
+                print(f"{name} BER at {snr_db} dB: {ber:.2e} (from {int(total_errors[name])} errors / {int(total_bits[name])} bits)")
+            else:
+                print(f"WARNING: No bits processed for {name}!")
+                ber = 0.0
             results_ber[name].append(ber)
 
     print("\n--- Final BER Results ---")
