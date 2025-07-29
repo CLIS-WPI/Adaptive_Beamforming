@@ -1036,6 +1036,8 @@ def quick_validation_test():
     # Test BER simulation with known inputs
     batch_size = 2
     Nr, Nt, num_subcarriers = 2, 8, 32
+    num_streams = 2  # Number of streams per user (Ns)
+    K = 4            # Number of users
     
     # Create dummy data
     H_test = tf.complex(
@@ -1044,9 +1046,30 @@ def quick_validation_test():
     )
     
     combiner_test = tf.complex(
-        tf.random.normal([batch_size, 2, Nr]),
-        tf.random.normal([batch_size, 2, Nr])
+        tf.random.normal([batch_size, num_streams, Nr]),
+        tf.random.normal([batch_size, num_streams, Nr])
     )
+    
+    # Create test precoders (instead of using fixed_V_k)
+    test_V_k_list = []
+    for _ in range(K):
+        V_k = tf.complex(
+            tf.random.normal([Nt, num_streams]),
+            tf.random.normal([Nt, num_streams])
+        )
+        # Normalize the precoder
+        V_k = V_k / tf.norm(V_k, axis=0, keepdims=True)
+        test_V_k_list.append(V_k)
+    
+    # Create test parameters dictionary
+    test_params = {
+        'Nr': Nr,
+        'Nt': Nt,
+        'Ns': num_streams,
+        'K': K,
+        'bits_per_symbol': 4,  # For 16-QAM
+        'mod_order': 16
+    }
     
     # Test with your actual functions
     mapper_test = Mapper("qam", 16)
@@ -1054,7 +1077,7 @@ def quick_validation_test():
     
     try:
         errors, bits = run_ber_simulation(
-            combiner_test, H_test, fixed_V_k, 0.1, PARAMS, mapper_test, demapper_test
+            combiner_test, H_test, test_V_k_list, 0.1, test_params, mapper_test, demapper_test
         )
         
         print(f"✅ BER simulation test passed: {errors.numpy()} errors / {bits.numpy()} bits")
