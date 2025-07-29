@@ -38,8 +38,11 @@ Key Steps:
 """
 
 import os
-import numpy as np
 import tensorflow as tf
+import sionna
+print(f"Sionna Version: {sionna.__version__}")
+print(f"TensorFlow Version: {tf.__version__}")
+import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import trange
 from sklearn.manifold import TSNE
@@ -133,7 +136,7 @@ RL_PARAMS = {
     'codebook_size': 256,
     'p_ue_max': 1.0,
     'num_quant_bits': 4,
-    'num_episodes': 2000,
+    'num_episodes': 100,
     'max_steps_per_episode': 100,
     'snr_db_train': 15.0,
     'gamma': 0.995,         # Discount factor
@@ -147,12 +150,21 @@ RL_PARAMS = {
 def safe_mrc_combiner(h, v):
     """Safe wrapper for mrc_combiner that handles empty or wrong-shaped inputs."""
     h_shape = tf.shape(h)
+    # Check if any dimension is 0
+    if tf.equal(h_shape[0], 0) or tf.equal(h_shape[1], 0):
+        # Return zeros of the expected shape
+        return tf.zeros([PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64)
+    try:
+        return mrc_combiner(h, v)
+    except Exception:
+        # Fallback if any other error occurs
+        return tf.zeros([PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64)
 
 # Evaluation Parameters
 EVAL_PARAMS = {
     'snr_dBs': np.arange(-20, 22, 2),
-    'num_channel_realizations': 1000, # Number of channels to average over
-    'batch_size': 128, # Batch size for vectorized BER calculation
+    'num_channel_realizations': 500, # Number of channels to average over
+    'batch_size': 512, # Batch size for vectorized BER calculation
 }
 
 
@@ -910,8 +922,18 @@ def main():
     # Plot 2: RL Agent Training Curve
     fig, ax = plt.subplots(figsize=(10, 7))
     def moving_average(data, window_size=20):
-        if len(data) < window_size: return np.array([])
-        return np.convolve(data, np.ones(window_size), 'valid') / window_size
+        """Compute the moving average with safety checks."""
+        try:
+            # Convert to flat numpy array if it's not already
+            data = np.array(data).flatten()
+            
+            # Check for sufficient data
+            if len(data) < window_size: 
+                return np.array([])
+            return np.convolve(data, np.ones(window_size), 'valid') / window_size
+        except Exception as e:
+            print(f"Warning: Error in moving average calculation: {e}")
+            return np.array([]) if len(data) == 0 else np.array([np.mean(data)])
 
     smoothed_rewards = moving_average(np.array(total_rewards_history))
     if smoothed_rewards.size > 0:
