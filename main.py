@@ -722,7 +722,7 @@ def main():
     ]
     
     mapper = Mapper("qam", PARAMS['mod_order'])
-    demapper = Demapper("app", "qam", PARAMS['bits_per_symbol'], hard_out=True)
+    demapper = Demapper("app", "qam", PARAMS['mod_order'])  # Use mod_order, not bits_per_symbol
 
     # --- 6.2. Calculate Fixed RBD Precoders ---
     print("--- Calculating Fixed Regularized Block Diagonalization (RBD) Precoders ---")
@@ -814,36 +814,54 @@ def main():
     print(f"Trained model weights saved to '{output_dir}' directory.")
 
     # --- 6.4. Evaluation Phase ---
-    print("\n--- Starting Final Evaluation Phase ---")
-    
+    # --- Fixed Evaluation Phase ---
+    print("\n--- Starting Fixed Evaluation Phase ---")
+
+    # Pre-compute channels and states
     print(f"Pre-computing {EVAL_PARAMS['num_channel_realizations']} channel realizations...")
-    channel_cache_cir = []  # Store CIR for frequency generation
+    channel_cache = []
     state_cache = []
-    eval_env = MIMOEnvironment(channels, encoder, fixed_V_k, fixed_s_k, 0, PARAMS, RL_PARAMS) # SNR doesn't matter here
-    for _ in trange(EVAL_PARAMS['num_channel_realizations'], desc="Generating Channels & States"):
-        # Generate fresh CIR for evaluation
+
+    eval_env = MIMOEnvironment(channels, encoder, fixed_V_k, fixed_s_k, 0, PARAMS, RL_PARAMS)
+
+    for i in trange(EVAL_PARAMS['num_channel_realizations'], desc="Generating Channels & States"):
+        # Generate channel
         h, path_delays = channels[0](batch_size=1, num_time_steps=1, sampling_frequency=PARAMS['sampling_frequency'])
-        channel_cache_cir.append((h, path_delays))  # Store for freq generation
-        # Also get state representation
-        state, H_k = eval_env.reset()
-        state_cache.append(tf.squeeze(state))
+        
+        # Convert to frequency domain
+        frequencies = subcarrier_frequencies(PARAMS['fft_size'], PARAMS['subcarrier_spacing'])
+        H_freq = cir_to_ofdm_channel(frequencies, h, path_delays)
+        H_k_freq = tf.squeeze(H_freq[..., 0, :, :, :])  # Remove batch and time dims
+        
+        channel_cache.append(H_k_freq)
+        
+        # Generate state
+        state, _ = eval_env.reset()
+        if state is not None:
+            state_cache.append(tf.squeeze(state))
+        else:
+            # If state is None, create a dummy state
+            dummy_state = tf.zeros([RL_PARAMS['embedding_dim']], dtype=tf.float32)
+            state_cache.append(dummy_state)
 
+    # Stack all data
+    H_k_freq_all = tf.stack(channel_cache)
+    state_all = tf.stack(state_cache)
 
-    # Generate frequency domain channels ONCE and keep as a list for memory efficiency
-    print("Generating frequency domain channels for evaluation (memory efficient)...")
-    temp_freqs = subcarrier_frequencies(PARAMS['fft_size'], PARAMS['subcarrier_spacing'])
-    def freq_channel_generator():
-        """Generate frequency domain channels on-demand for memory efficiency."""
-        try:
-            for i, (h, delays) in enumerate(channel_cache_cir):
-                H_f = cir_to_ofdm_channel(temp_freqs, h, delays)
-                yield tf.squeeze(H_f[..., 0, :, :, :128])
-        except Exception as e:
-            print(f"Error generating channel {i}: {e}")
-            raise
+    print(f"Generated {len(channel_cache)} channel realizations")
+    print(f"Channel shape: {H_k_freq_all.shape}")
+    print(f"State shape: {state_all.shape}")
 
-    # No stacking, just use generator in batch loop
+    # Add debug information
+    print("=== DEBUG INFORMATION ===")
+    print(f"Total channel realizations: {len(channel_cache)}")
+    print(f"Channel shape: {H_k_freq_all.shape if len(channel_cache) > 0 else 'No channels'}")
+    print(f"State cache length: {len(state_cache)}")
+    print(f"Batch size: {EVAL_PARAMS['batch_size']}")
+    print(f"SNR range: {EVAL_PARAMS['snr_dBs']}")
+    print("========================")
 
+    # BER evaluation
     results_ber = {"PPO": [], "MRC": [], "MMSE": []}
 
     for snr_db in EVAL_PARAMS['snr_dBs']:
@@ -853,93 +871,90 @@ def main():
         total_errors = {"PPO": 0.0, "MRC": 0.0, "MMSE": 0.0}
         total_bits = {"PPO": 0.0, "MRC": 0.0, "MMSE": 0.0}
         
-        # Calculate number of batches with ceiling division to handle all samples
-        total_samples = EVAL_PARAMS['num_channel_realizations']
-        batch_size = EVAL_PARAMS['batch_size']
-        num_batches = (total_samples + batch_size - 1) // batch_size  # Ceiling division
+        # Process in batches
+        num_samples = len(channel_cache)
+        batch_size = min(EVAL_PARAMS['batch_size'], num_samples)
+        num_batches = (num_samples + batch_size - 1) // batch_size
         
-        print(f"Processing {total_samples} samples in {num_batches} batches")
+        print(f"Processing {num_samples} samples in {num_batches} batches of size {batch_size}")
         
-        if num_batches == 0:
-            print("WARNING: No batches to process!")
-            # Add zeros to results and continue to next SNR
-            for name in results_ber.keys():
-                results_ber[name].append(0.0)
-            continue
-            
-        freq_channel_iter = iter(freq_channel_generator())
         for i in trange(num_batches, desc=f"SNR {snr_db} dB Batches"):
-            start_idx = i * EVAL_PARAMS['batch_size']
-            end_idx = min(start_idx + EVAL_PARAMS['batch_size'], total_samples)
-            batch_size_actual = end_idx - start_idx
+            start_idx = i * batch_size
+            end_idx = min(start_idx + batch_size, num_samples)
+            actual_batch_size = end_idx - start_idx
             
-            # Get next batch of frequency channels
-            H_k_batch_freq = []
-            for _ in range(batch_size_actual):
-                try:
-                    H_k_batch_freq.append(next(freq_channel_iter))
-                except StopIteration:
-                    print(f"WARNING: Ran out of channels at batch {i}, item {len(H_k_batch_freq)}")
-                    break
-            
-            if len(H_k_batch_freq) == 0:
-                print(f"WARNING: Empty batch at index {i}")
+            if actual_batch_size == 0:
                 continue
                 
-            H_k_batch_freq = tf.stack(H_k_batch_freq)
-            state_batch = tf.stack(state_cache[start_idx:end_idx])
+            # Get batch data
+            H_k_batch = H_k_freq_all[start_idx:end_idx]
+            state_batch = state_all[start_idx:end_idx]
             
-            # PPO Agent Action Selection
-            action_probs = actor(state_batch)
-            action_indices = tf.argmax(action_probs, axis=1)
-            W_ppo_batch = tf.gather(combiner_codebook, action_indices)
+            # Ensure we have the right number of subcarriers
+            if H_k_batch.shape[-1] > 128:
+                H_k_batch = H_k_batch[..., :128]  # Use first 128 subcarriers
             
-            # Baseline Combiners
-            H_k_batch_single_sc = H_k_batch_freq[:, :, :, 0] # Use one subcarrier for combiner calculation
+            print(f"Batch {i}: Processing {actual_batch_size} samples, H_k shape: {H_k_batch.shape}")
             
             try:
-                W_mrc_batch = tf.map_fn(
-                    lambda h: safe_mrc_combiner(h, fixed_V_k[0]), 
-                    H_k_batch_single_sc, 
-                    fn_output_signature=tf.TensorSpec(shape=[PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64)
-                )
+                # PPO Agent actions
+                action_probs = actor(state_batch)
+                action_indices = tf.argmax(action_probs, axis=1)
+                W_ppo_batch = tf.gather(combiner_codebook, action_indices)
                 
-                W_mmse_batch = tf.map_fn(
-                    lambda h: mmse_combiner(h, fixed_V_k, noise_var, PARAMS), 
-                    H_k_batch_single_sc, 
-                    fn_output_signature=tf.TensorSpec(shape=[PARAMS['Ns'], PARAMS['Nr']], dtype=tf.complex64)
-                )
+                # Baseline combiners (use single subcarrier for combiner calculation)
+                H_k_single = H_k_batch[:, :, :, 0]  # Shape: [batch, Nr, Nt]
                 
-                # Run BER simulation for each
-                err, bits = run_ber_simulation(W_ppo_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
-                total_errors["PPO"] += err
-                total_bits["PPO"] += bits
+                # MRC combiners
+                W_mrc_list = []
+                for j in range(actual_batch_size):
+                    W_mrc = mrc_combiner(H_k_single[j], fixed_V_k[0])
+                    W_mrc_list.append(W_mrc)
+                W_mrc_batch = tf.stack(W_mrc_list)
                 
-                err, bits = run_ber_simulation(W_mrc_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
-                total_errors["MRC"] += err
-                total_bits["MRC"] += bits
+                # MMSE combiners  
+                W_mmse_list = []
+                for j in range(actual_batch_size):
+                    W_mmse = mmse_combiner(H_k_single[j], fixed_V_k, noise_var, PARAMS)
+                    W_mmse_list.append(W_mmse)
+                W_mmse_batch = tf.stack(W_mmse_list)
                 
-                err, bits = run_ber_simulation(W_mmse_batch, H_k_batch_freq, fixed_V_k, noise_var, PARAMS, mapper, demapper)
-                total_errors["MMSE"] += err
-                total_bits["MMSE"] += bits
+                # Run BER simulations
+                methods = [("PPO", W_ppo_batch), ("MRC", W_mrc_batch), ("MMSE", W_mmse_batch)]
                 
+                for method_name, combiner_batch in methods:
+                    try:
+                        errors, bits = run_ber_simulation(
+                            combiner_batch, H_k_batch, fixed_V_k, noise_var, PARAMS, mapper, demapper
+                        )
+                        
+                        total_errors[method_name] += float(errors.numpy())
+                        total_bits[method_name] += float(bits.numpy())
+                        
+                        print(f"  {method_name}: {float(errors.numpy())} errors / {float(bits.numpy())} bits")
+                        
+                    except Exception as e:
+                        print(f"  Error in {method_name} simulation: {e}")
+                        continue
+                        
             except Exception as e:
                 print(f"Error processing batch {i}: {e}")
                 continue
-
-        # Calculate and store BER
-        for name in results_ber.keys():
-            if total_bits[name] > 0:
-                ber = total_errors[name] / total_bits[name]
-                print(f"{name} BER at {snr_db} dB: {ber:.2e} (from {int(total_errors[name])} errors / {int(total_bits[name])} bits)")
+        
+        # Calculate BER for this SNR
+        print(f"\nSNR {snr_db} dB Results:")
+        for method_name in results_ber.keys():
+            if total_bits[method_name] > 0:
+                ber = total_errors[method_name] / total_bits[method_name]
+                results_ber[method_name].append(ber)
+                print(f"  {method_name}: BER = {ber:.6e} ({int(total_errors[method_name])} errors / {int(total_bits[method_name])} bits)")
             else:
-                print(f"WARNING: No bits processed for {name}!")
-                ber = 0.0
-            results_ber[name].append(ber)
+                print(f"  {method_name}: No bits processed - setting BER = 0")
+                results_ber[method_name].append(0.0)
 
     print("\n--- Final BER Results ---")
     for name, ber_list in results_ber.items():
-        print(f"{name}: {[f'{b:.2e}' for b in ber_list]}")
+        print(f"{name}: {[f'{b:.2e}' if b > 0 else '0.00e+00' for b in ber_list]}")
 
     # --- 6.5. Plotting Results ---
     print("\n--- Generating and Saving Plots ---")
