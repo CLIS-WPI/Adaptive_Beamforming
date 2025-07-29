@@ -1028,6 +1028,46 @@ def main():
     # -*- coding: utf-8 -*-
 
     print("\n--- All tasks completed successfully. ---")
+# Add this test function at the end of your main.py
+def quick_validation_test():
+    """Quick test to validate the implementation"""
+    print("\n=== Running Quick Validation Test ===")
+    
+    # Test BER simulation with known inputs
+    batch_size = 2
+    Nr, Nt, num_subcarriers = 2, 8, 32
+    
+    # Create dummy data
+    H_test = tf.complex(
+        tf.random.normal([batch_size, Nr, Nt, num_subcarriers]),
+        tf.random.normal([batch_size, Nr, Nt, num_subcarriers])
+    )
+    
+    combiner_test = tf.complex(
+        tf.random.normal([batch_size, 2, Nr]),
+        tf.random.normal([batch_size, 2, Nr])
+    )
+    
+    # Test with your actual functions
+    mapper_test = Mapper("qam", 16)
+    demapper_test = Demapper("app", "qam", 16)
+    
+    try:
+        errors, bits = run_ber_simulation(
+            combiner_test, H_test, fixed_V_k, 0.1, PARAMS, mapper_test, demapper_test
+        )
+        
+        print(f"✅ BER simulation test passed: {errors.numpy()} errors / {bits.numpy()} bits")
+        print(f"✅ Test BER: {float(errors.numpy()) / float(bits.numpy()):.6e}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Test failed: {e}")
+        return False
 
+# Run the test before main execution
 if __name__ == "__main__":
+    # Uncomment to run validation test
+    # quick_validation_test()
     main()
+
