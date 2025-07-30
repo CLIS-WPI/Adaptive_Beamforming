@@ -569,7 +569,7 @@ encoder.load_weights("encoder.weights.h5")
 actor.load_weights("ppo_actor.weights.h5")
 
 NUM_EVAL_STEPS = 2000
-SNR_DBS_EVAL = np.arange(-10, 22, 2)
+SNR_DBS_EVAL = np.arange(-20, 22, 2)
 RESULTS_SE = {"PPO": [], "RBD": [], "MMSE": [], "MRC": []}
 
 # # This is for the case we use the online and  perfect CSI
