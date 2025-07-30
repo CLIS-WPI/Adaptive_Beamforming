@@ -19,7 +19,7 @@ from sionna.phy.channel import subcarrier_frequencies, cir_to_ofdm_channel
 
 # --- DEVICE CONFIGURATION ---
 # Set this to True to use the GPU; False to force CPU.
-USE_GPU = True
+USE_GPU = False
 if USE_GPU:
     print("Attempting to run on GPU...")
     gpus = tf.config.list_physical_devices('GPU')
@@ -458,8 +458,8 @@ PPO_CONFIG = {
 # TRAINING PHASE
 # ──────────────────────────────────────────────────────────────────────────────
 print("--- Starting PPO Agent Training ---")
-NUM_EPISODES = 2000
-MAX_STEPS_PER_EPISODE = 400
+NUM_EPISODES = 5000
+MAX_STEPS_PER_EPISODE = 200
 SNR_DB_TRAIN = 15.0
 
 # Model Instantiation
